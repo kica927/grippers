@@ -21,9 +21,21 @@ class Perception(ABC):
     @abstractmethod
     def measure_opening(self, box: BoxObservation) -> float:
         """`box` 앞에 정렬한 상태에서 입구 폭(mm)을 정밀 실측한다.
-        `POSE_PLAN` 이 이 값으로 φ 해 구간을 계산한다."""
+        `POSE_PLAN` 이 이 값으로 φ 해 구간을 계산한다.
+
+        **실측하지 못하면 `None`** — '해 없음' 취급이라 `POSE_PLAN` 이 `REJECT` 로
+        보낸다. 입구 폭을 모르는 채로 투입을 시도하면 상자 테두리에 물체를 찍는다.
+        (반환 타입 선언은 아직 `float` 이다 — `parse()` 와 같은 과도기로, 포트
+        시그니처를 한꺼번에 맞추는 후속 PR에서 정리한다.)"""
 
     @abstractmethod
     def monitor_clearance(self) -> Clearance:
-        """실제 측정이 되기 전까지는 **항상 `contact_risk=True` (정지)** 를 반환해야 한다 —
-        '모르면 멈춘다'가 기본값이다."""
+        """여유 공간을 관측한다. **실측 수단이 없거나 응답이 없으면
+        `contact_risk=True`(정지)** — '모르면 멈춘다'가 이 포트의 기본값이다.
+        측정 실패를 통과 신호로 두면 실제 장애물을 못 보고 밀고 지나가는 사고로
+        직결되므로, 이 메서드만은 실패값이 안전 쪽으로 치우쳐 있어야 한다.
+
+        ⚠️ '항상 True' 가 아니다. 비전이 미구현인 동안 real 구현이 True를 고정
+        반환하는 것은 **그 구현의 현재 상태**이지 포트 계약이 아니다. 시나리오를
+        주입받는 테스트 더블은 '모르는' 상태가 아니므로 기본값이 happy path여도
+        계약 위반이 아니다 (`ScriptedPerception.monitor_clearance` 참고)."""

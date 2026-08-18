@@ -19,7 +19,11 @@ from domain.values import MissionSpec
 class CommandInterpreter(ABC):
     @abstractmethod
     def parse(self, text: str) -> MissionSpec:
-        """자연어 명령 text를 MissionSpec으로 해석한다."""
+        """자연어 명령 text를 MissionSpec으로 해석한다.
+
+        **해석하지 못하면 `None`** — 예외를 올리지 않는다. 실패를 예외로 표현하면
+        루프 FSM이 흡수할 수 없고 미션 스레드가 그대로 죽는다. (반환 타입 선언은
+        아직 `MissionSpec` 이다 — 시그니처는 후속 PR에서 한꺼번에 맞춘다.)"""
 
     @abstractmethod
     def confirm_phrase(self, spec: MissionSpec) -> str:

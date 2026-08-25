@@ -62,12 +62,16 @@ def test_gripper_opens_before_descending():
 
 
 def test_records_every_measurement_the_user_asked_for():
-    """사용자가 요구한 항목: depth 면적·중심, 파지 시 load, 그리퍼캠 면적,
-    그리고 그것들을 빈 상태와 비교할 수 있을 것."""
+    """사용자가 요구한 항목: depth 면적·중심, 파지 시 load, 그리고 그것들을
+    빈 상태와 비교할 수 있을 것.
+
+    2026-08-25: 그리퍼캠 면적 항목(area_open/area_closed/area_carry_idle)은
+    뺐다 — 면적으로는 파지 성공을 판정할 수 없다는 것이 실측으로 확인돼
+    (빈 그리퍼 닫힘 165990px²가 룩을 문 상태 70384px²보다 컸다) 그리퍼캠
+    경로를 통째로 제거했기 때문이다. 판정은 CARRY_IDLE의 load로 한다."""
     source = ast.unparse(_function("main"))
 
-    for key in ("area_open", "area_closed", "load_closed", "load_midpoint",
-                "load_safe", "load_carry_idle", "area_carry_idle"):
+    for key in ("load_closed", "load_midpoint", "load_safe", "load_carry_idle"):
         assert f"'{key}'" in source, key
     assert "record['depth']" in source
 
@@ -78,16 +82,6 @@ def test_depth_record_carries_center_and_area():
 
     for key in ("'x'", "'h'", "'w'", "'area_px2'", "'forward_m'", "'lateral_m'"):
         assert key in source, key
-
-
-def test_area_measurement_uses_a_median_of_several_samples():
-    """단발 측정은 프레임마다 크게 튄다 — 2026-08-24 실기에서 1초 간격 연속
-    표본이 22564 -> 28430 -> 12794 -> 4383 -> 46480처럼 흔들렸다. 데이터로
-    남길 값은 그 잡음을 걷어내야 한다."""
-    source = ast.unparse(_function("measure_area"))
-
-    assert "values.sort()" in source
-    assert "len(values) // 2" in source
 
 
 def test_empty_run_is_the_baseline_and_is_marked_as_such():
@@ -134,15 +128,6 @@ def test_every_arm_failure_path_recovers_to_idle():
     source = ast.unparse(_function("main"))
 
     assert source.count("recover_idle") >= 5
-
-
-def test_restarts_perception_node_it_killed():
-    fn = _function("main")
-    tries = [node for node in ast.walk(fn) if isinstance(node, ast.Try)]
-    finalbody = ast.unparse(tries[0].finalbody)
-
-    assert "restart_perception_node" in finalbody
-    assert finalbody.index("cam.close") < finalbody.index("restart_perception_node")
 
 
 def test_carry_idle_comes_between_the_grasp_and_the_basket_drop():

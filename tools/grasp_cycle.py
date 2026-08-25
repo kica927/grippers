@@ -56,10 +56,8 @@ from grasp_test_console import (
     CLASS_TO_PROFILE,
     GRIPPER_CLOSED_MM,
     GraspTestNode,
-    GripperCam,
     RunLog,
     estimate_position,
-    restart_perception_node,
     save_yolo_annotated,
 )
 from grippers_arm.floor_grasp_profiles import FLOOR_GRASP_PROFILES
@@ -76,31 +74,6 @@ DATASET_PATH = "/grippers/recordings/grasp_dataset.jsonl"
 LOAD_SETTLE_S = 1.2
 
 LOAD_THRESHOLD = 0.04  # domain/task/states.py GraspState.LOAD_THRESHOLD과 동일
-
-
-def measure_area(cam, label, log, samples=5):
-    """그리퍼캠 면적을 여러 번 재서 중앙값을 쓴다.
-
-    단발 측정은 프레임마다 크게 튄다 — 2026-08-24 실기 4단계 로그에서 1초
-    간격 연속 표본이 22564 -> 28430 -> 12794 -> 4383 -> 46480처럼 흔들렸다.
-    데이터로 남길 값은 그 잡음을 걷어내야 한다."""
-    values = []
-    for _ in range(samples):
-        area = cam.measure_area_px2()
-        if area is not None:
-            values.append(area)
-        time.sleep(0.15)
-    if not values:
-        print(f"  [{label}] 그리퍼캠 면적: 검출 안 됨")
-        log.log("area", where=label, area_px2=None, samples=0)
-        return None
-    values.sort()
-    median = values[len(values) // 2]
-    print(f"  [{label}] 그리퍼캠 면적: {median:.0f}px²  (표본 {len(values)}, "
-          f"최소 {values[0]:.0f} 최대 {values[-1]:.0f})")
-    log.log("area", where=label, area_px2=median, samples=len(values),
-            min_px2=values[0], max_px2=values[-1])
-    return median
 
 
 def measure_load(node, label, log):
@@ -208,9 +181,6 @@ def print_comparison(record, baseline):
         return
     print(f"  기준선 기록 시각: {baseline.get('t_iso', '?')}")
     for key, label, unit in (
-        ("area_open", "그리퍼캠(열림)", "px²"),
-        ("area_closed", "그리퍼캠(닫힘)", "px²"),
-        ("area_carry_idle", "그리퍼캠(CARRY_IDLE)", "px²"),
         ("load_closed", "load(닫힘)", ""),
         ("load_midpoint", "load(midpoint)", ""),
         ("load_safe", "load(safe)", ""),
@@ -278,8 +248,6 @@ def main():
 
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = GraspTestNode()
-    cam = None
-    perception_was_killed = False
     try:
         input("\n배치 완료 후 Enter로 시작 (Ctrl+C로 중단): ")
 
@@ -319,15 +287,8 @@ def main():
             node.move_floor_pose(profile, "recover_idle")
             return 2
 
-        # perception_node가 /dev/gripper_cam을 쥐고 있어 넘겨받는다.
-        subprocess.run(["pkill", "-f", "grippers_perception/perception_node"],
-                       stdin=subprocess.DEVNULL)
-        perception_was_killed = True
-        time.sleep(1.0)
-        cam = GripperCam()
 
         print("\n[3] 파지 전 측정 (열린 채 내려온 상태)")
-        record["area_open"] = measure_area(cam, "열림", log)
         record["load_open"] = measure_load(node, "열림", log)
 
         # --- 파지 ------------------------------------------------------
@@ -337,7 +298,6 @@ def main():
             print("  닫기 실패 — arm.log 확인")
             node.move_floor_pose(profile, "recover_idle")
             return 3
-        record["area_closed"] = measure_area(cam, "닫힘", log)
         record["load_closed"] = measure_load(node, "닫힘", log)
 
         # --- 들어올려 CARRY_IDLE까지 ------------------------------------
@@ -354,7 +314,6 @@ def main():
                 node.move_floor_pose(profile, "recover_idle")
                 return 4
             record[key] = measure_load(node, stage if stage != "idle" else "CARRY_IDLE", log)
-        record["area_carry_idle"] = measure_area(cam, "CARRY_IDLE", log)
 
         # --- 바구니 투하 ------------------------------------------------
         if args.no_drop:
@@ -368,7 +327,6 @@ def main():
             record["load_before_release"] = measure_load(node, "투하 직전", log)
             node.set_gripper(preopen_mm)
             record["load_after_release"] = measure_load(node, "놓은 뒤", log)
-            record["area_after_release"] = measure_area(cam, "놓은 뒤", log)
             node.move_floor_pose(profile, "idle")
             node.set_gripper(GRIPPER_CLOSED_MM)
 
@@ -385,10 +343,6 @@ def main():
     finally:
         log.log("run_end")
         log.close()
-        if cam is not None:
-            cam.close()
-        if perception_was_killed:
-            restart_perception_node()
         node.destroy_node()
         rclpy.shutdown()
 

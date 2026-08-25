@@ -1,13 +1,21 @@
 """gripper_cam_publisher_node — /dev/gripper_cam(raw V4L2)을 ROS2 Image 토픽으로 퍼블리시.
 
-그리퍼캠은 아직 ROS2 드라이버 없이 raw V4L2 장치로만 존재한다
-(perception_node._capture_grasp_frame 참고 — 이 노드도 같은 캡처 방식을
-쓴다). live_yolo_demo.py 같은 ROS2 구독 기반 도구를 depth_cam뿐 아니라
-gripper_cam에도 그대로 붙이기 위한 최소 브리지.
+그리퍼캠은 ROS2 드라이버 없이 raw V4L2 장치로만 존재한다. live_yolo_demo.py
+같은 ROS2 구독 기반 도구를 depth_cam뿐 아니라 gripper_cam에도 그대로 붙이기
+위한 최소 브리지다.
 
-⚠️ perception_node의 confirm_grasp 서비스도 같은 장치를 독점적으로 열려고
-한다 — 이 노드와 동시에 실행하면 V4L2 장치 경합(Device or resource busy)이
-난다. 실기 검증 시엔 둘 중 하나만 켜둘 것.
+2026-08-25: 이 노드가 /dev/gripper_cam의 **유일한 소유자**가 됐다.
+예전에는 perception_node의 confirm_grasp 서비스가 __init__ 시점에 같은
+장치를 열어 fd를 계속 쥐고 있어서, 이 노드와 동시에 실행하면 V4L2 경합
+(Device or resource busy)이 났다. 그 confirm_grasp 경로는 면적/밝기차로는
+파지 성공을 판정할 수 없다는 것이 실측으로 확인돼(빈 그리퍼 닫힘
+165990px²가 룩을 문 상태 70384px²보다 컸고, 이탈한 축구공의 diff 1.88이
+빈 그리퍼 4.65보다 낮았다) 통째로 제거했다. 파지 판정은 CARRY_IDLE의
+load로 한다.
+
+용도는 시연·디버깅 화면이다 — 팔을 내리면 depth 카메라가 가려져 거리
+표시가 사라지는 구간에서 사람이 눈으로 확인할 유일한 시야다. 거리 추정에는
+쓰지 않는다(오버헤드 ArUco 좌표가 그 역할을 한다).
 """
 
 import cv2

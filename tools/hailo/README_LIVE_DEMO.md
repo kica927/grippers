@@ -21,8 +21,9 @@
 - `depth_cam_rotate_node`(depth cam 180도 회전 보정)와
   `gripper_cam_publisher_node`(그리퍼캠 raw V4L2 → ROS2 Image 브리지)가
   먼저 떠 있어야 한다 — 둘 다 `grippers_perception` 패키지 소속.
-- `perception_node`의 `confirm_grasp` 서비스는 `/dev/gripper_cam`을
-  독점하려고 하므로 `gripper_cam_publisher_node`와 동시 실행 금지.
+- 2026-08-25: `perception_node`가 더는 `/dev/gripper_cam`을 열지 않는다
+  (그리퍼캠 기반 `confirm_grasp` 제거). `gripper_cam_publisher_node`가
+  장치의 유일한 소유자이므로 동시 실행 제약이 사라졌다.
 
 ## 실행
 

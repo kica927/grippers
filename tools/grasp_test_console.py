@@ -93,10 +93,8 @@ import select
 import subprocess
 import sys
 import termios
-import threading
 import time
 import tty
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
 import numpy as np
@@ -324,9 +322,210 @@ class KeyReader:
             raise KeyboardInterrupt
 
 
-# --- 그리퍼 캠: 공유 프레임 버퍼 + MJPEG 스트림 ---------------------------
+# --- ROS2 노드 ------------------------------------------------------------
 
 
+class GraspTestNode(Node):
+    def __init__(self):
+        super().__init__("grasp_test_console")
+        self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
+        self.create_subscription(Odometry, "odom_raw", self._on_odom, 10)
+        self._pose = None  # (x, y) m, odom_raw 원본 좌표계
+
+        # 1단계 YOLO 캡처용 — depth_cam_rotate_node가 180도 보정해 내보내는
+        # 스트림이다(원본 rgb0/image는 카메라가 거꾸로 달려 뒤집혀 나온다).
+        # perception_node가 observe_target에 쓰는 것과 같은 토픽이라, 캡처
+        # 이미지가 곧 그 판정이 본 화면이다.
+        self._latest_rgb = None
+        self.create_subscription(Image, "depth_cam/rgb/image_rotated", self._on_rgb, 10)
+
+        self._observe_client = self.create_client(ObserveTarget, "perception/observe_target")
+        self._gripper_client = self.create_client(SetGripper, "arm_driver/set_gripper")
+        self._load_client = self.create_client(GetLoad, "arm_driver/get_load")
+        self._floor_pose_client = ActionClient(self, MoveToFloorPose, "arm_driver/move_to_floor_pose")
+
+    def _on_odom(self, msg: Odometry):
+        p = msg.pose.pose.position
+        self._pose = (p.x, p.y)
+
+    def _on_rgb(self, msg: Image):
+        self._latest_rgb = msg
+
+    def pump(self):
+        """구독 콜백(오도메트리)만 처리한다 — 서비스/액션 대기는 각 호출부에서
+        spin_until_future_complete로 직접 한다. 이 스크립트는 유일한
+        executor이므로(mission_orchestrator처럼 이미 도는 executor가 없다)
+        _ros_call.py의 "중첩 executor 금지" 경고가 적용되지 않는다."""
+        rclpy.spin_once(self, timeout_sec=0.0)
+
+    def observe(self, raw_cls: str, timeout_sec=3.0):
+        if not self._observe_client.wait_for_service(timeout_sec=timeout_sec):
+            print("  [경고] perception/observe_target 서비스 없음")
+            return None
+        future = self._observe_client.call_async(ObserveTarget.Request(raw_cls=raw_cls))
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+        return future.result() if future.done() else None
+
+    def set_gripper(self, width_mm: float, timeout_sec=5.0):
+        if not self._gripper_client.wait_for_service(timeout_sec=timeout_sec):
+            print("  [경고] arm_driver/set_gripper 서비스 없음")
+            return None
+        future = self._gripper_client.call_async(SetGripper.Request(width_mm=width_mm))
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+        return future.result() if future.done() else None
+
+    def get_load(self, timeout_sec=3.0):
+        if not self._load_client.wait_for_service(timeout_sec=timeout_sec):
+            print("  [경고] arm_driver/get_load 서비스 없음")
+            return None
+        future = self._load_client.call_async(GetLoad.Request())
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+        return future.result().load_ratio if future.done() else None
+
+    def move_floor_pose(self, profile: str, stage: str, timeout_sec=30.0) -> bool:
+        if not self._floor_pose_client.wait_for_server(timeout_sec=5.0):
+            print("  [경고] arm_driver/move_to_floor_pose 액션 서버 없음")
+            return False
+        goal = MoveToFloorPose.Goal(profile=profile, stage=stage)
+        goal_future = self._floor_pose_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, goal_future, timeout_sec=5.0)
+        if not goal_future.done() or goal_future.result() is None or not goal_future.result().accepted:
+            print(f"  [실패] {stage} 단계 거부됨(서보 과열/자세 조건 등 — arm.log 확인)")
+            return False
+        result_future = goal_future.result().get_result_async()
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout_sec)
+        if not result_future.done():
+            print(f"  [실패] {stage} 단계 결과 없음(타임아웃)")
+            return False
+        reached = result_future.result().result.reached
+        print(f"  move_to_floor_pose({profile}, {stage}) -> reached={reached}")
+        return reached
+
+    def stop(self):
+        for _ in range(10):  # 0.5초 — Ctrl+C 시 잔여 발행을 확실히 밀어넣는다
+            self.cmd_pub.publish(Twist())
+            time.sleep(0.05)
+
+
+def estimate_position(obs: ObserveTarget.Response, raw_cls: str):
+    """(전방 m, 좌/우 m, +면 우측) — 없으면 (None, None)."""
+    if obs is None or not obs.found:
+        return None, None
+    k = K_CLASS.get(raw_cls)
+    if k is None:
+        print(f"  [경고] '{raw_cls}'는 거리 보정값(K_CLASS) 미실측 — 전방 거리 계산 불가")
+        return None, None
+    area_px2 = obs.h * obs.w
+    if area_px2 <= 0:
+        return None, None
+    effective_px = math.sqrt(area_px2) - BBOX_PADDING_PX
+    if effective_px <= 0:
+        return None, None
+    z_m = k / effective_px
+    lateral_m = (obs.x - CX_PX) * z_m / FX_PX + LATERAL_BIAS_M
+    return z_m, lateral_m
+
+
+def _bgr_from_image_msg(msg: Image) -> np.ndarray:
+    """Image -> BGR. cv_bridge를 쓰지 않는다 — 이 환경의 cv_bridge 확장이
+    numpy 1.x ABI로 빌드돼 numpy 2.x와 충돌해 세그폴트를 낸다(2026-08-23
+    실기 확인, perception_node.py의 같은 이름 함수와 같은 이유)."""
+    buf = np.frombuffer(msg.data, dtype=np.uint8)
+    enc = msg.encoding.lower()
+    if enc in ("bgr8", "rgb8"):
+        img = buf.reshape(msg.height, msg.width, 3)
+        return img[:, :, ::-1] if enc == "rgb8" else img
+    if enc == "mono8":
+        return cv2.cvtColor(buf.reshape(msg.height, msg.width), cv2.COLOR_GRAY2BGR)
+    raise ValueError(f"지원하지 않는 인코딩: {msg.encoding}")
+
+
+def save_yolo_annotated(node: GraspTestNode, raw_cls: str, out_dir: str = YOLO_CAPTURE_DIR):
+    """1단계 관측 시점의 RGB 프레임에 YOLO 검출을 그려 저장한다.
+
+    관측(observe_target)이 왜 그 결과를 냈는지 눈으로 확인하기 위한 것이다 —
+    특히 found=False일 때 "물체가 화면에 없었나 / 잡혔는데 신뢰도가 낮았나 /
+    다른 클래스로 잡혔나"를 가른다. 그래서 임계값을 perception_node보다 낮게
+    (YOLO_CAPTURE_CONF) 잡아 **탈락한 검출까지** 그린다. 목표 클래스는 초록,
+    나머지는 회색으로 구분한다.
+
+    ultralytics는 여기서만 import한다 — 모델 로딩이 수 초 걸려서, 이 기능을
+    안 쓰는 다른 단계까지 느려지면 안 된다. 실패(모델 없음·프레임 없음)는
+    예외를 올리지 않고 None을 돌려준다 — 진단용 부가 기능이 본 테스트를
+    중단시키면 안 된다."""
+    # ⚠️ 이 콘솔은 상시 스핀하지 않는다 — 구독 콜백은 node.pump()나
+    # spin_until_future_complete()가 도는 동안에만 처리된다. 1단계에서
+    # observe_target 서비스가 없으면 그 경로마저 거의 안 돌아서 _latest_rgb가
+    # None인 채로 여기 온다(2026-08-24 실기 확인). 프레임이 올 때까지 잠깐
+    # 직접 펌프한다.
+    deadline = time.time() + RGB_WAIT_TIMEOUT_S
+    while node._latest_rgb is None and time.time() < deadline:
+        node.pump()
+        time.sleep(0.05)
+    if node._latest_rgb is None:
+        print(f"  [캡처] {RGB_WAIT_TIMEOUT_S}s 안에 RGB 프레임이 안 옴 — "
+              "depth_cam_rotate_node / ascamera_node가 떠 있는지 확인할 것")
+        return None
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        print("  [캡처] ultralytics 미설치 — YOLO 캡처 건너뜀")
+        return None
+
+    try:
+        frame = _bgr_from_image_msg(node._latest_rgb).copy()
+        model = YOLO(YOLO_MODEL_PATH)
+        result = model.predict(frame, verbose=False, conf=YOLO_CAPTURE_CONF)[0]
+    except Exception as exc:  # noqa: BLE001 -- 진단 기능이 테스트를 막지 않는다
+        print(f"  [캡처] YOLO 실행 실패({exc}) — 건너뜀")
+        return None
+
+    lines = []
+    for box in result.boxes:
+        conf = float(box.conf[0])
+        name = result.names[int(box.cls[0])]
+        x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+        is_target = name == raw_cls
+        color = (0, 255, 0) if is_target else (160, 160, 160)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, f"{name} {conf:.2f}", (x1, max(14, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        lines.append(f"{name} conf={conf:.2f} bbox=({x1},{y1},{x2},{y2}) h={y2-y1} w={x2-x1}")
+
+    if not lines:
+        cv2.putText(frame, "NO DETECTION", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"step1_{raw_cls}_{time.strftime('%Y%m%d_%H%M%S')}.jpg")
+    cv2.imwrite(path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    print(f"  [캡처] YOLO 적용 이미지 저장: {path}")
+    for line in lines:
+        print(f"    - {line}")
+    if not lines:
+        print(f"    - 검출 0건 (conf {YOLO_CAPTURE_CONF} 기준)")
+    return {"path": path, "detections": lines}
+
+
+def print_position(node: GraspTestNode, raw_cls: str, label: str) -> dict:
+    """관측·출력하고, RunLog에 그대로 넣을 수 있는 dict로 돌려준다."""
+    obs = node.observe(raw_cls)
+    if obs is None or not obs.found:
+        print(f"  [{label}] 물체를 못 찾음")
+        return {"found": False}
+    z_m, lateral_m = estimate_position(obs, raw_cls)
+    info = {"found": True, "x": obs.x, "h": obs.h, "w": obs.w}
+    if z_m is None:
+        print(f"  [{label}] x={obs.x:.1f} h={obs.h:.1f} w={obs.w:.1f} (거리 계산 불가)")
+        return info
+    side = "우측" if lateral_m >= 0 else "좌측"
+    print(f"  [{label}] 전방 {z_m*100:.1f}cm, {side} {abs(lateral_m)*100:.1f}cm "
+          f"(x={obs.x:.1f} h={obs.h:.1f} w={obs.w:.1f})")
+    info.update(forward_m=z_m, lateral_m=lateral_m)
+    return info
+
+
+# --- 주행 루프(공용) -------------------------------------------------------
 
 
 def drive_phase(
@@ -408,7 +607,6 @@ WASD_KEYMAP = {
 
 
 
-
 def recover_to_idle(node: "GraspTestNode", profile: str, log: "RunLog", why: str) -> bool:
     """실패로 중단할 때 팔을 IDLE로 되돌린다(사용자 요청, 2026-08-24).
 
@@ -455,11 +653,14 @@ def main():
     log = RunLog(args.raw_cls, profile)
     print(f"분석용 로그 파일: {log.path}  (끝나면 이 파일을 Claude에게 넘길 것)")
 
-    # ⚠️ 이 콘솔은 3단계에서 그리퍼캠을 넘겨받으려고 perception_node를 죽인다
-    # (아래 subprocess.run(pkill) 참고). 그래서 **한 번 3단계까지 간 뒤 다시
-    # 실행하면** observe_target이 없어 1·2단계가 통째로 무력해진다 —
-    # 2026-08-24 실기에서 실제로 겪었고, 화면상으로는 "물체를 못 찾음"으로만
-    # 보여 원인을 알기 어려웠다. 시작 시점에 미리 확인해 준다.
+    # perception_node가 없으면 1·2단계 관측과 YOLO 캡처가 전부 실패하는데,
+    # 화면상으로는 "물체를 못 찾음"으로만 보여 원인을 알기 어렵다(2026-08-24
+    # 실기). 시작 시점에 미리 확인해 준다.
+    #
+    # 2026-08-25: 예전에는 이 콘솔이 그리퍼캠을 넘겨받으려고 3단계에서
+    # perception_node를 죽였기 때문에 이 확인이 특히 중요했다. 그리퍼캠
+    # 경로를 제거해 더는 죽이지 않지만, 다른 이유로 안 떠 있을 수 있으므로
+    # 확인 자체는 남긴다.
     if subprocess.run(
         ["pgrep", "-f", "grippers_perception/perception_node"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

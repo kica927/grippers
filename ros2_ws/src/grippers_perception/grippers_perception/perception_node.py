@@ -19,18 +19,16 @@ scan_floor는 Hailo-10H YOLO로 실제 검출을 반환할 수 있지만 `scan_f
 """
 
 import math
+import statistics
 import time
 
 import rclpy
 from geometry_msgs.msg import Point, Vector3
-from grippers_interfaces.msg import BoxObservation, Detection, DetectionArray
+from grippers_interfaces.msg import Detection, DetectionArray
 from grippers_interfaces.srv import (
     ConfirmGrasp,
-    FindBox,
-    MeasureOpening,
     MonitorClearance,
     ObserveTarget,
-    ScanFloor,
 )
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
@@ -140,8 +138,36 @@ HAILO_SCORE_THRESHOLD = 0.8
 # 상태였다. 시연 전에 감당할 위험이 아니라 /grippers/models(호스트
 # ~/docker/shared/grippers/models에 바인드 마운트되어 컨테이너 수명과
 # 무관하게 남는다)로 옮기고 기본값을 그쪽으로 돌린다.
-# sha256 9680cf7d156c32cdc8082214108451aa3e110598c0ce7ee3cf541791d173182c
-# (맥 ~/Downloads/grippers_model_backup/best_cpu.pt에도 같은 파일 보관)
+#
+# ## 배포된 가중치 (2026-08-26 train-9로 교체)
+#
+# 경로는 고정하고 파일만 갈아 끼운다 — 경로를 버전마다 바꾸면 코드와 실기가
+# 어긋날 때 어느 쪽이 맞는지 알 수 없게 된다. 이전 버전은 같은 디렉터리에
+# 이름을 붙여 남기므로 되돌리려면 그 파일을 best_cpu.pt로 덮으면 된다.
+#
+#   train-9  2026-08-26  sha256 bd13ae42b9a080d85a9c620b983d7c4ad45d6f69ccc0a99da6c44cb0ce6490c8
+#   train-8  2026-08-21  sha256 9680cf7d156c32cdc8082214108451aa3e110598c0ce7ee3cf541791d173182c
+#            되돌리기: models/best_cpu_train8_20260821.pt
+#
+# 클래스 구성은 두 버전이 **완전히 같다**(6종, 인덱스까지 동일:
+# 0 knight / 1 queen / 2 rook / 3 box / 4 soccer / 5 star). 매핑 코드를
+# 손댈 필요가 없다는 뜻이다.
+#
+# 검증 지표는 전 항목이 올랐다:
+#
+#            train-8   train-9
+#   precision  0.932    0.973
+#   recall     0.862    0.956    <- +9.3%p
+#   mAP50      0.935    0.984
+#   mAP50-95   0.829    0.948    <- +11.9%p
+#
+# ⚠️ recall이 크게 오른 것은 **게이트 임계를 다시 봐야 한다는 뜻**이기도 하다.
+# 지금 걸려 있는 오검출 게이트(conf 0.70 · bottom-y 290 · 5중 3 합의)는
+# train-8의 검출 분포를 보고 잡은 값이다. train-9는 진짜 물체를 더 높은
+# 신뢰도로 잡을 가능성이 크므로 게이트가 헐거워졌을 수 있다 —
+# tools/grasp_geometry_calibrate.py --mode gate로 여유를 다시 재 볼 것.
+#
+# (맥 ~/Downloads/grippers_model_backup/ 에 두 버전 모두 보관)
 CPU_YOLO_MODEL_PATH_DEFAULT = "/grippers/models/best_cpu.pt"
 # ⚠️ 2026-08-23: 단일 프레임 신뢰도 임계값을 0.8까지 올려 오검출을 억누르던
 # 방식(2026-08-22 시도)을 폐기했다 — 대신 HANDOFF.md가 실기로 검증한 2단계
@@ -224,6 +250,62 @@ APPROACH_STANDOFF_M = 0.18
 # 이전과 완전히 같은 값을 내고, 그 거리에서 멀어질수록 룩 데이터가 옳다고
 # 말하는 방향으로만 달라진다.
 BBOX_PADDING_PX = 2.5
+
+# ── observe_target 전용 오검출 게이트 (2026-08-26) ────────────────────────
+#
+# observe_target은 **단일 프레임** 경로라 scan_floor의 다중 프레임 합의를
+# 통째로 건너뛴다. 원래는 시각 서보 루프가 매 반복 부르는 저지연 관측이라
+# 그게 맞았는데, 그 루프가 Host로 넘어가면서 이제 이 서비스를 쓰는 곳은
+# GRASP 진입 판정과 파지 확인 — **차가 멈춰 있는 순간**뿐이다. 그래서
+# 억제를 다시 걸 여유가 생겼다.
+#
+# 걸지 않으면 어떻게 되는지 2026-08-26에 실기로 봤다. CARRY 자세에서
+# 사무실 배경을 향해 관측하자 **닫힌 노트북을 rook 0.60으로**, 다른
+# 노트북을 knight 0.49로 잡았다. identify_target은 모든 클래스 중 가장 큰
+# 검출을 고르므로, 그대로 두면 노트북을 집으러 내려간다.
+#
+# 세 겹으로 막는다.
+
+# (1) 신뢰도 — 사용자 지시 2026-08-26. floor_consensus.CONF_THRESHOLD(0.45)는
+# 다중 프레임 합의가 뒤에서 걸러 주는 것을 전제로 넉넉히 연 값이라 여기엔
+# 맞지 않는다.
+#
+# 실측 여유(2026-08-26): 파지 자리의 진짜 rook은 conf 0.93~0.94로 나온다.
+# 여유 +0.23이라 이 게이트가 진짜 물체를 막지 않는다.
+OBSERVE_CONF_THRESHOLD = 0.70
+
+# (2) 화면상 위치 — 파지 거리(0.15~0.4m)의 바닥 물체는 화면 아래쪽에 온다.
+# 배경·먼 물체는 위쪽이다. 위 오검출 5개의 bbox 아래끝이 144~240px로 전부
+# 이 선 위였다(화면 높이 480).
+#
+# 실측 여유(2026-08-26): 파지 자리의 진짜 rook은 아래끝 383.7~383.9px로
+# 나온다. 여유 +94px.
+#
+# ⚠️ **이 게이트가 없으면 안 된다.** 같은 실측에서 배경 노트북이 rook
+# conf 0.80~0.81로 잡혔다 — 신뢰도 게이트(0.70)를 **넘는다.** 그것을 막는
+# 것은 아래끝 206~215px, 즉 이 게이트뿐이다. 두 게이트가 서로 다른 오검출을
+# 맡고 있으므로 어느 하나도 뺄 수 없다.
+OBSERVE_MIN_BOTTOM_Y_PX = 290.0
+
+# (3) 다중 프레임 합의 — 배경 오검출은 프레임마다 깜빡인다. 2026-08-26의
+# 노트북 오검출은 7프레임 중 2번만 나왔다.
+OBSERVE_CONSENSUS_FRAMES = 5
+OBSERVE_CONSENSUS_MIN_HITS = 3
+
+# 표본을 이만큼 재사용한다. identify_target이 클래스 6개를 연달아 묻는데,
+# 그때마다 5프레임을 새로 뜨면 6배가 든다 — 같은 순간의 같은 표본으로
+# 답하는 것이 맞고 더 빠르다.
+#
+# ⚠️ 수집 자체가 약 1.7초 걸린다(5프레임 x CPU 추론, 2026-08-26 실측).
+# 창이 그보다 짧으면 캐시가 **항상** 만료돼 있어 아무 효과가 없다 — 처음
+# 1.0초로 뒀다가 실기 로그에서 6번 연속 재수집하는 것을 보고 늘렸다.
+# 창은 수집 시간보다 넉넉히 길어야 하고, 만료 기준 시각도 수집을 **마친**
+# 시점이어야 한다.
+OBSERVE_CACHE_SEC = 3.0
+
+# 표본을 모으는 데 허용하는 상한. 프레임은 약 7Hz로 오고 그때마다 CPU
+# 추론이 붙으므로 5장에 1~2초가 든다.
+OBSERVE_COLLECT_TIMEOUT_SEC = 4.0
 CLASS_DISTANCE_CALIBRATION_SQRT_PX_M = {
     # 2026-08-23 실측(핫스팟 연결 실기, observe_target 서비스로 단일 프레임
     # h×w 직접 측정 — scan_floor의 consensus 게이트(MIN_BOTTOM_Y_PX=290)는
@@ -235,7 +317,20 @@ CLASS_DISTANCE_CALIBRATION_SQRT_PX_M = {
     # 2026-08-24에 K = distance_m * (sqrt(bbox_area_px) - BBOX_PADDING_PX)로
     # 다시 계산했다(위 주석 참고). 각 클래스의 실측 1점은 그대로 재현된다.
     "knight": 35.9307,  # 실측 0.84m (이전 상수모델 38.0307)
-    "queen": 28.3382,  # 실측 1.13m (이전 상수모델 31.1632)
+    # ⚠️ 2026-08-26: 28.3382에서 고침. 1.13m **한 점**으로 잡은 K를 파지
+    # 거리 0.15m까지 7.5배 외삽하고 있었고, 실제로 깨져 있었다.
+    #
+    # --mode scale(줄자로 100mm 밀고 판독 변화를 봄)에서 f = 0.807 —
+    # 수평으로 100mm 움직였는데 판독은 80.7mm만 변했다. 2026-08-25에
+    # 같은 물리 18cm를 14.4cm로 읽었던 것(배율 0.800)과 같은 값이고,
+    # 그 둘은 **서로 다른 모델(train-8 / train-9)에서 나왔다.**
+    # 즉 모델 교체 탓이 아니라 원래부터 K가 틀려 있었다.
+    #
+    # 보정 = 28.3382 / 0.807. 보정 뒤 두 가지가 저절로 맞는다:
+    #   턱 선   rook 0.1757 vs queen 0.1761  (물리적으로 같은 자리, 차이 0.4mm)
+    #   좌우 영점 29.5 / 31.4 / 29.7 mm      (카메라 옆 오프셋, 폭 1.9mm)
+    # 독립적으로 잰 값들이 두 물리량으로 수렴하므로 보정이 옳다고 본다.
+    "queen": 35.1155,  # 보정 2026-08-26 (구 28.3382 = 1.13m 1점)
     "rook": 34.8340,  # 0.40 / 0.70 / 1.04m 3점 최소제곱 (이전 상수모델 37.3992)
     "box": None,  # 미실측 — 60프레임 중 0회 검출(floor_consensus.py 경고 참고), 물체 자체를 아직 못 잡음
     "soccer": 18.9592,  # 실측 0.66m (이전 상수모델 20.6092)
@@ -293,6 +388,10 @@ class PerceptionNode(Node):
         cb_group = ReentrantCallbackGroup()
 
         self._latest_frame = None
+        self._frame_seq = 0
+        # observe_target 다중 프레임 표본 캐시 — (표본, 수집 시각)
+        self._observe_samples_cache = None
+        self._observe_samples_at = 0.0
         self._rgb_fx = self._rgb_cx = None
         if _CV_AVAILABLE:
             # depth_cam_rotate_node가 내보내는 회전 보정된 컬러 스트림.
@@ -320,24 +419,6 @@ class PerceptionNode(Node):
         else:
             self.get_logger().warn("sensor_msgs 미설치 — 카메라 구독 비활성화")
 
-        self.create_service(
-            ScanFloor,
-            "perception/scan_floor",
-            self._on_scan_floor,
-            callback_group=cb_group,
-        )
-        self.create_service(
-            FindBox,
-            "perception/find_box",
-            self._on_find_box,
-            callback_group=cb_group,
-        )
-        self.create_service(
-            MeasureOpening,
-            "perception/measure_opening",
-            self._on_measure_opening,
-            callback_group=cb_group,
-        )
         self.create_service(
             MonitorClearance,
             "perception/monitor_clearance",
@@ -448,6 +529,7 @@ class PerceptionNode(Node):
 
     def _on_image(self, msg):
         self._latest_frame = msg
+        self._frame_seq += 1
 
     def _on_rgb_camera_info(self, msg):
         self._rgb_fx = msg.k[0]
@@ -504,40 +586,6 @@ class PerceptionNode(Node):
         u = (x1 + x2) / 2.0
         y_obj = -(u - self._rgb_cx) * z_m / self._rgb_fx
         return _standoff_arrival_pose(z_m, y_obj)
-
-    # ---- 서비스 콜백 ----
-    def _on_scan_floor(self, request, response):
-        # TODO: 상자 영역 마스킹 (state_machine.md §4 재진입 방지 방어선) — 실제
-        # 위치 추정이 붙으면, 여기서 상자 ROI와 겹치는 detection을 걸러내야 한다.
-        # 필터링을 빼먹으면 이미 처리된 상자 내부 물체를 계속 재검출해 무한 루프
-        # 방지의 첫 번째 방어선(done_ids/held_ids 필터링)이 무력화된다.
-        if not self.get_parameter("scan_floor_enabled").value:
-            # 안전 게이트 — 모듈 상단 SCAN_FLOOR_ENABLED_DEFAULT 경고 참고.
-            # pose_m이 자리표시자인 채로 SELECT/APPROACH가 실제 베이스를
-            # 움직이는 걸 막는 기본값이다. 구조 검증 때만 명시적으로 켤 것.
-            response.detections = DetectionArray(detections=[])
-            return response
-
-        if self._latest_frame is None:
-            self.get_logger().warn("scan_floor: 프레임 없음 — 빈 목록 반환")
-            response.detections = DetectionArray(detections=[])
-            return response
-
-        if self._hailo_model is not None:
-            frame = _bgr_from_image_msg(self._latest_frame)
-            detections = self._scan_floor_detections_hailo(frame)
-        elif self._cpu_yolo_model is not None:
-            # 단일 프레임이 아니라 여러 프레임을 새로 모은다 — 다중 프레임
-            # 합의 필터(아래 _scan_floor_detections_cpu_yolo 참고)의 입력이
-            # 필요해서, 여기서 미리 떠 둔 self._latest_frame 한 장으로는
-            # 부족하다.
-            detections = self._scan_floor_detections_cpu_yolo()
-        else:
-            self.get_logger().warn("scan_floor: 백엔드 미로드 — 빈 목록 반환")
-            detections = []
-
-        response.detections = DetectionArray(detections=detections)
-        return response
 
     def _scan_floor_detections_hailo(self, frame):
         canvas = self._letterbox(frame, self._hailo_input_size)
@@ -674,56 +722,158 @@ class PerceptionNode(Node):
             confidence=score,
         )
 
-    def _on_observe_target(self, request, response):
-        """base_driver_node의 approach_object 액션(시각 서보 루프)이 매 반복마다
-        부르는 저지연 관측. scan_floor(다중 프레임 합의)와는 목적이 다르다 —
-        이건 SELECT가 이미 고른 특정 raw 클래스 하나를 반복 재관측하며
-        수렴시키는 제어 루프 입력이라, 매 반복의 지연이 곧 루프 주기다.
-        tools/perception/approach.py도 이동마다 다시 관측해 오차를 스스로
-        지우는 폐루프라 여기서도 최신 프레임 1장이면 충분하다 — 노이즈는
-        다음 반복이 알아서 고친다.
+    def _gate_observe_detections(self, detections):
+        """observe_target 전용 오검출 게이트 — 신뢰도와 화면상 위치.
 
-        CPU YOLO 백엔드 전용(Hailo는 하드웨어 고장 #189로 다루지 않는다).
-        모델 미로드·프레임 없음·해당 클래스 미검출은 전부 found=False —
-        "모르면 실패" 관례. 여러 후보가 있으면 가장 큰(=가까운) 것을 고른다
-        (tools/perception/approach.py의 pick()과 동일)."""
+        걸러낸 것을 세어 돌려준다. 조용히 버리면 "왜 아무것도 안 잡히나"를
+        실기에서 추적할 수 없다."""
+        kept, weak, high = [], 0, 0
+        for class_name, score, bbox in detections:
+            if score < OBSERVE_CONF_THRESHOLD:
+                weak += 1
+                continue
+            if bbox[3] < OBSERVE_MIN_BOTTOM_Y_PX:
+                # 화면 위쪽 = 멀거나 바닥이 아니다. 파지 거리의 물체는
+                # 아래쪽에 온다.
+                high += 1
+                continue
+            kept.append((class_name, score, bbox))
+        return kept, weak, high
+
+    def _observe_samples(self):
+        """정지 전제 다중 프레임 표본. 캐시가 살아 있으면 재사용한다.
+
+        캐시를 두는 이유: identify_target이 클래스 6개를 연달아 묻는데,
+        그때마다 5프레임을 새로 뜨면 6배가 든다. 같은 순간을 묻는 질문이니
+        같은 표본으로 답하는 것이 맞고 더 빠르다."""
+        now = time.monotonic()
+        if (self._observe_samples_cache is not None
+                and now - self._observe_samples_at < OBSERVE_CACHE_SEC):
+            return self._observe_samples_cache
+
+        frames = self._collect_cpu_yolo_frames(
+            OBSERVE_CONSENSUS_FRAMES, OBSERVE_COLLECT_TIMEOUT_SEC)
+        gated, weak_total, high_total = [], 0, 0
+        for frame_detections in frames:
+            kept, weak, high = self._gate_observe_detections(frame_detections)
+            gated.append(kept)
+            weak_total += weak
+            high_total += high
+        if weak_total or high_total:
+            self.get_logger().info(
+                f"[observe] 게이트 탈락 — 신뢰도<{OBSERVE_CONF_THRESHOLD} {weak_total}건, "
+                f"화면 위쪽(y<{OBSERVE_MIN_BOTTOM_Y_PX:.0f}) {high_total}건 "
+                f"({len(frames)}프레임)")
+        self._observe_samples_cache = gated
+        # 수집을 **마친** 시각을 쓴다. 시작 시각을 쓰면 수집에 걸린 시간이
+        # 창에서 먼저 깎여 나가 캐시가 거의 즉시 만료된다.
+        self._observe_samples_at = time.monotonic()
+        return gated
+
+    def _on_observe_target(self, request, response):
+        """정면 목표 하나를 관측한다. GRASP 진입 판정과 파지 확인이 쓴다.
+
+        ⚠️ 2026-08-26에 단일 프레임에서 다중 프레임 합의로 바꿨다. 원래는
+        시각 서보 루프가 매 반복 부르는 저지연 관측이라 최신 한 장이면
+        충분했는데(노이즈는 다음 반복이 고친다), 그 루프가 Host로 넘어가면서
+        이제 이 서비스를 쓰는 곳은 **차가 멈춰 있는 판정 순간**뿐이다.
+        되돌리는 반복이 없으므로 한 장의 오검출이 그대로 결정이 된다.
+
+        같은 날 실기: CARRY 자세에서 사무실 배경을 향해 관측하자 닫힌
+        노트북을 rook 0.60으로 잡았다. 7프레임 중 2번만 나왔으므로 합의가
+        걸러 낸다.
+
+        CPU YOLO 백엔드 전용. 모델 미로드·프레임 없음·합의 미달은 전부
+        found=False — "모르면 실패" 관례. 여러 후보가 있으면 가장 큰(=가까운)
+        것을 고른다."""
         response.found = False
         response.x = 0.0
         response.h = 0.0
         response.w = 0.0
+        response.metric_ok = False
+        response.forward_m = 0.0
+        response.lateral_m = 0.0
         if self._cpu_yolo_model is None or self._latest_frame is None:
             return response
 
-        frame = _bgr_from_image_msg(self._latest_frame)
-        raw_detections = self._yolo_raw_frame_detections(frame)
-        candidates = [d for d in raw_detections if d[0] == request.raw_cls]
-        if not candidates:
+        samples = self._observe_samples()
+        boxes = []
+        for frame_detections in samples:
+            candidates = [d for d in frame_detections if d[0] == request.raw_cls]
+            if candidates:
+                # 가장 큰 높이 = 가장 가까운 것.
+                boxes.append(max(candidates, key=lambda d: d[2][3] - d[2][1])[2])
+
+        if len(boxes) < OBSERVE_CONSENSUS_MIN_HITS:
+            if boxes:
+                self.get_logger().info(
+                    f"[observe] {request.raw_cls} {len(boxes)}/{len(samples)}프레임 — "
+                    f"합의 미달(최소 {OBSERVE_CONSENSUS_MIN_HITS}) → 검출 없음으로 본다")
             return response
 
-        _, _, bbox = max(candidates, key=lambda d: d[2][3] - d[2][1])  # 가장 큰 높이
+        # 프레임마다 조금씩 흔들리므로 좌표별 중앙값을 쓴다 — 한 프레임이
+        # 크게 튀어도 결과가 끌려가지 않는다.
+        bbox = tuple(statistics.median(b[i] for b in boxes) for i in range(4))
         x1, y1, x2, y2 = bbox
         response.found = True
         response.x = (x1 + x2) / 2.0
         response.h = y2 - y1
         response.w = x2 - x1
+
+        # 미터 환산 — GRASP 진입 판정이 "물체가 턱이 쓸고 갈 영역 안에
+        # 있는가"를 재려면 픽셀이 아니라 거리가 필요하다. 실패하면 값을
+        # 지어내지 않고 metric_ok=False로 남긴다.
+        metric = self._target_offsets_m(request.raw_cls, bbox)
+        if metric is not None:
+            response.metric_ok = True
+            response.forward_m, response.lateral_m = metric
         return response
 
-    def _on_find_box(self, request, response):
-        # request.color는 와이어 필드명이 아직 레거시라 그렇다 — 2026-08-23
-        # 확정 미션 명세서로 domain.values.BoxColor가 Destination(LEFT/RIGHT)
-        # 으로 바뀌었고 지금 이 필드엔 그 이름이 들어온다(domain/adapters/
-        # real/_ros_convert.py 상단 경고 참고).
-        self.get_logger().warn(
-            f"find_box(dest={request.color}): 비전 파이프라인 미구현 — found=False 반환"
-        )
-        response.found = False
-        response.box = BoxObservation()
-        return response
+    def _target_offsets_m(self, class_name, bbox_xyxy):
+        """bbox -> (전방 거리 m, 좌우 오프셋 m). 모르면 **None**.
 
-    def _on_measure_opening(self, request, response):
-        self.get_logger().warn("measure_opening: 비전 파이프라인 미구현 — 0.0 반환")
-        response.opening_mm = 0.0
-        return response
+        `_approach_pose_m`과 같은 수식을 쓰되 정지 거리 보정 없이 물체 자체의
+        위치를 낸다 — 그쪽은 "어디에 서야 하는가"를, 이쪽은 "물체가 어디에
+        있는가"를 답한다."""
+        ## ⚠️ 이 카메라는 정면 아래로 11.3도 기울어져 있다 (사용자 2026-08-26)
+        #
+        # 라이다와 **같은 각도**다. 그동안 코드 어디에도 안 적혀 있었다.
+        # 아래 두 줄은 지금 그대로가 맞다 — 다만 이유를 모르면 나중에 누군가
+        # "기울었으니 cos을 곱해야지"라고 고쳐서 망가뜨리기 딱 좋은 자리다.
+        #
+        # **좌우는 기울기와 무관하다.** 순수 pitch는 카메라 자신의 x축을
+        # 회전시키지 않으므로 좌우 축은 수평으로 남는다. 아래 핀홀 좌우 식과
+        # 클래스별 좌우 영점은 그대로 유효하다 — 좌우에 cos을 곱하면 틀린다.
+        #
+        # **전방은 조심해야 하지만, 실측이 지금 방식을 지지한다.** 기울어진
+        # 광선을 따라 잰 거리는 수평 거리가 아니고 둘은 가까울수록 크게
+        # 갈린다 — 바닥 물체가 카메라보다 0.10~0.15m 아래라면 수평으로 1mm
+        # 움직일 때 광선 거리는 0.18m에서 0.77~0.87mm만 변한다(K를 잡은
+        # 0.66~1.04m에서는 0.98~0.995mm로 사실상 같다).
+        #
+        # 그런데 이 비율은 **1을 넘을 수 없다.** 2026-08-26에 줄자로 재며
+        # 측정한 값이 1.033 ± 0.023이었다. 즉 이 판독은 기울어진 광선 거리가
+        # 아니라 수평 변위를 거의 1:1로 따라간다 — bbox 면적 모델이
+        # 경험적으로 그렇게 맞춰져 있다. **cos(11.3도)을 곱하면 안 된다.**
+        #
+        # 같은 이유로 척도 실측의 +3.3%도 기울기로는 설명되지 않는다.
+        # 기울기는 비율을 1 아래로만 끌 수 있다.
+        #
+        # (뎁스 **영상**에서 직접 읽은 거리는 다르다. 그쪽은 진짜 기울어진
+        # 광선 거리라 수평 거리나 라이다 값과 비교하려면 기하를 적용해야 한다.)
+        x1, y1, x2, y2 = bbox_xyxy
+        bbox_area_px = (x2 - x1) * (y2 - y1)
+        if bbox_area_px < MIN_BBOX_AREA_PX:
+            return None
+        k_class = CLASS_DISTANCE_CALIBRATION_SQRT_PX_M.get(class_name)
+        if k_class is None or self._rgb_fx is None:
+            return None
+        effective_px = math.sqrt(bbox_area_px) - BBOX_PADDING_PX
+        if effective_px <= 0.0:
+            return None
+        z_m = k_class / effective_px
+        u = (x1 + x2) / 2.0
+        return z_m, -(u - self._rgb_cx) * z_m / self._rgb_fx
 
     def _on_monitor_clearance(self, request, response):
         # 안전 원칙: 실제 측정 전까지는 항상 정지 신호. 절대 False로 바꾸지 말 것.

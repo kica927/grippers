@@ -11,7 +11,7 @@ from dataclasses import dataclass
 # importlib.util.spec_from_file_location으로 단독 로드되기도 하는데, 그
 # 경로에선 패키지 컨텍스트가 없어 상대 import(`from .gripper_calibration`)가
 # "attempted relative import with no known parent package"로 깨진다.
-from grippers_arm.gripper_calibration import GRIPPER_CLOSED_MM, GRIPPER_OPEN_MM
+from grippers_arm.gripper_calibration import GRIPPER_GRASP_MIN_MM, GRIPPER_OPEN_MM
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,7 @@ class FloorGraspProfile:
     grasp_center_height_mm: float
     preopen_width_mm: float
     close_width_mm: float
+    release_width_mm: float
 
 
 # 2026-08-24: preopen_width_mm을 80.0(임의로 잡았던 절반쯤 열기)에서
@@ -43,29 +44,70 @@ class FloorGraspProfile:
 # 3양자(0.0117)뿐이라 기존 여유는 성공/실패 경계 위에 놓여 있었다.
 GRIPPER_SQUEEZE_MM = 15.0
 
+# 투하 시 벌릴 여유 — 물체 폭보다 이만큼만 더 연다.
+#
+# 2026-08-25 사용자 지시: "물체를 놓을 때 완전히 벌리지 말고 물체가 그리퍼
+# 사이에서 나올 정도로만 벌려." 예전에는 preopen_width_mm(=GRIPPER_OPEN_MM,
+# 168.0)으로 활짝 열었는데, 손가락 판이 바구니 위로 넓게 쓸릴 뿐 얻는 것이
+# 없다. 물체가 턱 사이에서 빠져나오는 데 필요한 것은 물체 폭보다 조금 더
+# 벌어지는 것뿐이다.
+#
+# GRIPPER_SQUEEZE_MM과 같은 15.0을 쓴다 — 닫을 때 폭에서 15 빼고, 놓을 때
+# 폭에 15 더한다. 대칭이라 기억하기 쉽고, rook(24.5) 기준 39.5mm로 열려
+# 168mm 대비 훨씬 좁다.
+GRIPPER_RELEASE_MM = 15.0
+
+
+def _release_width(object_width_mm: float) -> float:
+    """물체가 턱 사이에서 빠져나올 만큼만 벌린 목표 폭.
+
+    기구 상한(GRIPPER_OPEN_MM)을 넘지 않는다. 넓은 물체
+    (soccer_polyhedron 46.0 -> 61.0)도 상한에 한참 못 미친다."""
+    return min(GRIPPER_OPEN_MM, round(object_width_mm + GRIPPER_RELEASE_MM, 1))
+
 
 def _close_width(object_width_mm: float) -> float:
     """물체 폭에서 GRIPPER_SQUEEZE_MM만큼 더 좁힌 목표 폭.
 
-    기구 하한(GRIPPER_CLOSED_MM) 아래로는 내려가지 않는다. 얇은 체스말은
-    이 하한에 걸려 여유를 다 못 쓴다 — queen(17.0mm)은 8.0mm, knight
-    (22.0mm)은 13.0mm까지만 조일 수 있다. queen의 파지가 늘 가장 약했던
-    (2026-08-24 실측 최소 마진 4양자) 진짜 이유가 이것이다: 더 세게 쥐려면
-    GRIPPER_CLOSED_MM 자체를 재보정해야 한다.
+    **파지 전용** 하한(GRIPPER_GRASP_MIN_MM) 아래로는 내려가지 않는다 —
+    빈 닫힘 폭(GRIPPER_CLOSED_MM)이 아니다. 물체가 턱을 멈춰 주므로 파지
+    때는 더 좁게 명령해 위치 오차(=힘)를 키울 수 있기 때문이다.
+
+    2026-08-25 실측으로 하한을 9.0에서 7.0으로 내렸다(사용자 지시 "최대한
+    세게 잡자"). 얇은 체스말 둘이 이 하한에 걸려 있었고, 이제 knight 기준
+    파지 부하가 0.0235에서 0.0626으로 2.7배가 된다. 7.0 아래로는 부하가
+    포화해 더 얻을 것이 없다 — 근거는 GRIPPER_GRASP_MIN_MM 주석 참고.
     """
-    return max(GRIPPER_CLOSED_MM, round(object_width_mm - GRIPPER_SQUEEZE_MM, 1))
+    return max(GRIPPER_GRASP_MIN_MM, round(object_width_mm - GRIPPER_SQUEEZE_MM, 1))
 
 
 # 2026-08-24: 낮은 물체 3종(cube/star_column/soccer_polyhedron)의 파지 중심
 # 높이를 20.0 -> 26.0mm로 올림. 아래 HORIZONTAL_GABE_LOW_26_DEG 주석 참고.
 FLOOR_GRASP_PROFILES = {
-    "cube": FloorGraspProfile(40.0, 26.0, GRIPPER_OPEN_MM, _close_width(40.0)),
-    "star_column": FloorGraspProfile(45.0, 26.0, GRIPPER_OPEN_MM, _close_width(45.0)),
-    "soccer_polyhedron": FloorGraspProfile(46.0, 26.0, GRIPPER_OPEN_MM, _close_width(46.0)),
-    "chess_knight": FloorGraspProfile(22.0, 60.0, GRIPPER_OPEN_MM, _close_width(22.0)),
-    "chess_rook": FloorGraspProfile(24.5, 45.0, GRIPPER_OPEN_MM, _close_width(24.5)),
-    "chess_queen": FloorGraspProfile(17.0, 50.0, GRIPPER_OPEN_MM, _close_width(17.0)),
+    "cube": FloorGraspProfile(40.0, 26.0, GRIPPER_OPEN_MM, _close_width(40.0), _release_width(40.0)),
+    "star_column": FloorGraspProfile(45.0, 26.0, GRIPPER_OPEN_MM, _close_width(45.0), _release_width(45.0)),
+    "soccer_polyhedron": FloorGraspProfile(46.0, 26.0, GRIPPER_OPEN_MM, _close_width(46.0), _release_width(46.0)),
+    "chess_knight": FloorGraspProfile(22.0, 60.0, GRIPPER_OPEN_MM, _close_width(22.0), _release_width(22.0)),
+    "chess_rook": FloorGraspProfile(24.5, 45.0, GRIPPER_OPEN_MM, _close_width(24.5), _release_width(24.5)),
+    "chess_queen": FloorGraspProfile(17.0, 50.0, GRIPPER_OPEN_MM, _close_width(17.0), _release_width(17.0)),
 }
+
+# GRASP 단계의 물체 배치 전제 — 차체 전면에서 물체 **중심**까지, 정면으로.
+#
+# 2026-08-25 사용자 지시: "GRASP 시 물체의 중심은 모두 19cm 앞(정면)에 있는
+# 것을 전제로 하자."
+#
+# 왜 180이 아니라 190인가: 같은 날 여섯 물체를 전부 차체 전면 180mm에 놓고
+# 돌렸는데, star_column이 **내려오는 그리퍼 위로 올라탔다**(사용자 관찰).
+# cube/star/soccer가 쓰는 GABE 저자세는 접근축이 6.49도 아래를 향해 손가락
+# 판이 파지 중심보다 앞·아래로 뻗는다 — 180mm에서는 그 판이 낮은 물체를
+# 감싸는 대신 그 위에 내려앉는다. 10mm가 그 여유를 만든다.
+#
+# ⚠️ 이 값은 depth 카메라가 보고하는 전방 거리와 **같지 않다**. 같은 날
+# 물리적으로 같은 180mm에 놓인 물체들이 카메라 기준 14.4(queen) /
+# 18.3(rook) / 18.7(knight) / 25.6cm(soccer)로 읽혔다 — 클래스별 K_CLASS
+# 보정값에 실제 오차가 있어서, 카메라 숫자로 배치를 확인할 수 없다.
+GRASP_OBJECT_CENTER_FORWARD_MM = 190.0
 
 # The smallest successful settled load measured while holding an object was
 # 0.0704.  Keep the existing domain threshold lower than that value; load alone
@@ -123,6 +165,25 @@ HORIZONTAL_CHESS_KNIGHT_60_DEG = (-1.67, 86.10, 3.06, -89.67, 84.30)
 # 2026-08-24: servo 1-5 전체를 reteach_idle_pose.py로 손으로 다시 잡음 —
 # torque 해제 후 팔 전체를 원하는 IDLE 자세로 재포즈(그리퍼 정면 정렬 포함).
 IDLE_CRADLE_RAW = (2066, 829, 3092, 2751, 3071)
+
+# 물체를 **든 채 주행할 때만** 쓰는 자세. IDLE에서 servo 4(손목)만 들어올린다.
+#
+# 왜 IDLE을 그냥 안 고치는가: IDLE은 빈손 복귀·시작·정렬이 함께 쓰는 자세이고,
+# 그 자세는 관절 부하가 전부 0인 크래들 안착 상태다(위 주석). 손목을 올리면
+# 주행 내내 servo 4가 무게를 버텨야 하므로, 그 대가를 물체를 든 구간에만
+# 치르게 한다.
+#
+# 왜 필요한가 (2026-08-26 실측): 나이트를 문 채 IDLE에 있으면 그리퍼와 물체가
+# 라이다 정면을 통째로 가린다 — 정면 ±30도 79점 중 58점(79%)이 4.5~6.8cm로
+# 막혔고, 막힌 방위가 -19~+23도로 바구니 탐지에 쓸 구간과 정확히 겹쳤다.
+# servo 4를 2751 -> 2514(-237 raw, -20.8도)로 올리자 가림이 0%가 되고
+# 최근접이 4.5cm에서 71.2cm로 열렸다. 손으로 재포즈해 잡은 값이다.
+#
+# ⚠️ 여유는 아직 모른다. 막힘(-92)과 열림(-237) 사이 어디에 경계가 있는지
+# 재지 않았다 — 주행 진동으로 손목이 처지면 다시 막힐 수 있다.
+# ⚠️ depth 카메라 시야는 아직 확인 안 했다. confirm_grasp()가 "CARRY에서 팔이
+# 프레임 밖"을 전제하는데 20.8도 올린 뒤에도 그런지 봐야 한다.
+CARRY_RAW = (2066, 829, 3092, 2514, 3071)
 
 # IDLE_CRADLE과 수평 자세 사이에서 차체 접촉 없이 검증한 중간 waypoint.
 VERTICAL_SAFE_OVERHEAD_DEG = (0.0, 9.2, 20.8, 55.3, 0.4)

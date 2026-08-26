@@ -8,18 +8,11 @@ perception_node에 서비스로 말을 건다.
 넘기면 런타임에 AssertionError가 난다. 필드 하나하나를 명시적으로
 꺼내 옮긴다."""
 
-from grippers_interfaces.srv import (
-    ConfirmGrasp,
-    FindBox,
-    MeasureOpening,
-    MonitorClearance,
-    ScanFloor,
-)
+from grippers_interfaces.srv import MonitorClearance, ObserveTarget
 
 from domain.adapters.real._ros_call import SAFETY_TIMEOUT_SEC, call_service
-from domain.adapters.real._ros_convert import box_observation_from_msg, box_observation_to_msg
 from domain.ports.perception import Perception
-from domain.values import BoxObservation, Clearance, Destination, Detection, ObjectClass, Point3
+from domain.values import Clearance, TargetObservation
 
 
 def _blind_clearance() -> Clearance:
@@ -31,61 +24,49 @@ def _blind_clearance() -> Clearance:
     return Clearance(front_m=0.0, left_m=0.0, right_m=0.0, contact_risk=True)
 
 
-def _detection_from_msg(msg) -> Detection:
-    return Detection(
-        track_id=msg.track_id,
-        cls=ObjectClass[msg.cls],
-        pose_m=Point3(x=msg.pose.x, y=msg.pose.y, z=msg.pose.z),
-        dims_m=Point3(x=msg.dims.x, y=msg.dims.y, z=msg.dims.z),
-        yaw_rad=msg.yaw_rad,
-        confidence=msg.confidence,
-    )
-
-
 class Ros2Perception(Perception):
     def __init__(self, node):
         self._node = node
-        self._scan_client = node.create_client(ScanFloor, "perception/scan_floor")
-        self._find_box_client = node.create_client(FindBox, "perception/find_box")
-        self._measure_opening_client = node.create_client(
-            MeasureOpening, "perception/measure_opening"
-        )
         self._clearance_client = node.create_client(
             MonitorClearance, "perception/monitor_clearance"
         )
-        self._confirm_grasp_client = node.create_client(ConfirmGrasp, "perception/confirm_grasp")
+        self._observe_client = node.create_client(ObserveTarget, "perception/observe_target")
+        # GRASP 직전에 기억해 둔 목표 관측 (remember_target -> confirm_grasp)
+        self._remembered: tuple[str, float, float] | None = None
 
-    def scan_floor(self) -> list[Detection]:
-        """검출 목록. 서비스가 없거나 응답이 없으면 **빈 목록** — `SELECT` 가
-        고를 후보가 없어 `DONE` 으로 간다. 관측이 안 되는데 계속 도는 것보다
-        미션을 끝내고 이유를 로그로 남기는 편이 낫다."""
-        res = call_service(self._node, self._scan_client, ScanFloor.Request(), label="scan_floor")
-        if res is None:
-            return []
-        return [_detection_from_msg(d) for d in res.detections.detections]
+    # Pi 자기 뎁스캠이 알아볼 수 있는 raw 클래스들. perception_node의 YOLO
+    # 라벨과 같아야 한다. 순서가 우선순위다 — 여러 개가 동시에 보이면
+    # 앞쪽을 고른다.
+    KNOWN_LABELS = ("queen", "knight", "rook", "box", "star", "soccer")
 
-    def find_box(self, dest: Destination) -> BoxObservation | None:
-        """찾지 못했거나 서비스가 응답하지 않으면 **None** — `TRANSPORT` 가
-        대상을 보류 등록하고 `SCAN` 으로 복귀한다.
+    def identify_target(self):
+        """정면 물체의 raw 라벨. 못 찾으면 **None**.
 
-        ⚠️ FindBox.srv의 필드명은 아직 `color`다(_ros_convert.py 상단 경고와
-        같은 이유로 와이어 인터페이스는 이번 변경 범위 밖) — Destination의
-        이름("LEFT"/"RIGHT")을 그 문자열 필드에 담아 보낸다."""
-        req = FindBox.Request(color=dest.name)
-        res = call_service(self._node, self._find_box_client, req, label="find_box")
-        if res is None or not res.found:
-            return None
-        return box_observation_from_msg(res.box)
+        `ObserveTarget`은 "이 클래스가 보이나"를 묻는 서비스라 클래스를
+        하나씩 물어본다. 서비스를 새로 만들지 않고 있는 것으로 푸는 쪽을
+        택했다 — GRASP 진입 때 한 번만 도는 경로라 왕복 몇 번의 비용이
+        인터페이스를 늘리는 비용보다 싸다.
 
-    def measure_opening(self, box: BoxObservation) -> float | None:
-        """입구 폭(mm). 서비스가 없거나 응답이 없으면 **None**(해 없음 취급) —
-        `POSE_PLAN` 이 `REJECT` 로 보낸다. 입구 폭을 모르는 채로 투입을 시도하면
-        상자 테두리에 물체를 찍는다."""
-        req = MeasureOpening.Request(box=box_observation_to_msg(box))
-        res = call_service(self._node, self._measure_opening_client, req, label="measure_opening")
-        if res is None:
-            return None
-        return res.opening_mm
+        여러 개가 동시에 보이면 **가장 큰 것**을 고른다. 파지하러 내려가는
+        거리에서는 목표가 화면에서 가장 크고, 배경에 걸친 다른 물체는 작게
+        잡히기 때문이다."""
+        best, best_area = None, 0.0
+        for label in self.KNOWN_LABELS:
+            res = call_service(
+                self._node, self._observe_client,
+                ObserveTarget.Request(raw_cls=label), label="identify_target")
+            if res is None or not res.found:
+                continue
+            area = float(res.h) * float(res.w)
+            if area > best_area:
+                best_area = area
+                best = TargetObservation(
+                    label=label,
+                    forward_m=float(res.forward_m),
+                    lateral_m=float(res.lateral_m),
+                    metric_ok=bool(res.metric_ok),
+                )
+        return best
 
     def monitor_clearance(self) -> Clearance:
         """여유 공간. 서비스가 없거나 응답이 없으면 **`contact_risk=True`** —
@@ -115,19 +96,49 @@ class Ros2Perception(Perception):
             contact_risk=res.contact_risk,
         )
 
-    def confirm_grasp(self) -> bool:
-        """그리퍼캠 시각 확인. 서비스가 없거나 응답이 없으면 **False** —
-        다른 관측 포트와 같은 "모르면 실패" 관례.
+    # ---- 파지 확인: "그 자리에 있던 것이 사라졌는가" -----------------------
+    #
+    # 임계값 근거. 두 관측 사이에 로봇은 미세 전진으로 몇 cm 앞으로 간다 —
+    # 물체가 그대로 있다면 더 **가까워져** bbox 높이가 오히려 커진다. 그래서
+    # "여전히 있다"는 h_after >= h_before * STILL_THERE_H_RATIO 로 잡는다.
+    # 비율을 1.0 이 아니라 0.8 로 두는 것은 관측 잡음과 살짝 밀린 경우까지
+    # 실패로 보기 위해서다 — 이 방향의 오판(성공인데 실패라고 함)은 사람이
+    # 확인하게 만들 뿐이지만, 반대 방향은 빈 그리퍼로 미션을 계속하게 한다.
+    STILL_THERE_H_RATIO = 0.8
 
-        ⚠️ 1단계(로깅 전용): `confidence` 는 도메인 계약에 없으므로 여기서
-        진단 로그로만 남기고 버린다 — GraspState가 판정에 편입할 임계값을
-        잡을 실측 자료다."""
+    def remember_target(self, raw_cls: str) -> bool:
         res = call_service(
-            self._node, self._confirm_grasp_client, ConfirmGrasp.Request(), label="confirm_grasp"
-        )
-        if res is None:
+            self._node, self._observe_client,
+            ObserveTarget.Request(raw_cls=raw_cls), label="remember_target")
+        if res is None or not res.found or res.h <= 0.0:
+            self._remembered = None
+            self._node.get_logger().warn(
+                f"[remember_target] {raw_cls} 관측 실패 — 파지 확인을 쓸 수 없다")
             return False
+        self._remembered = (raw_cls, float(res.h), float(res.x))
         self._node.get_logger().info(
-            f"[confirm_grasp] confirmed={res.confirmed} confidence={res.confidence:.3f}"
-        )
-        return res.confirmed
+            f"[remember_target] {raw_cls} h={res.h:.1f}px x={res.x:.1f}px")
+        return True
+
+    def confirm_grasp(self) -> bool:
+        if self._remembered is None:
+            self._node.get_logger().warn("[confirm_grasp] 기준 관측이 없다 — False")
+            return False
+        raw_cls, h_before, _x_before = self._remembered
+        res = call_service(
+            self._node, self._observe_client,
+            ObserveTarget.Request(raw_cls=raw_cls), label="confirm_grasp")
+        if res is None:
+            self._node.get_logger().warn("[confirm_grasp] 관측 응답 없음 — False")
+            return False
+        if not res.found:
+            self._node.get_logger().info(
+                f"[confirm_grasp] {raw_cls} 가 정면에서 사라졌다 "
+                f"(before h={h_before:.1f}px) — 파지 성공으로 본다")
+            return True
+        still_there = res.h >= h_before * self.STILL_THERE_H_RATIO
+        self._node.get_logger().info(
+            f"[confirm_grasp] {raw_cls} h={res.h:.1f}px (before {h_before:.1f}px) -> "
+            + ("그대로 있다 — 파지 실패" if still_there
+               else "멀리 있는 다른 개체 — 파지 성공으로 본다"))
+        return not still_there

@@ -3,40 +3,30 @@ grippers_perception의 LearnedPerception이 이걸 구현한다."""
 
 from abc import ABC, abstractmethod
 
-from domain.values import BoxObservation, Clearance, Destination, Detection
+from domain.values import Clearance, TargetObservation
 
 
 class Perception(ABC):
     @abstractmethod
-    def scan_floor(self) -> list[Detection]:
-        """바닥을 전역 관측해 검출 목록을 반환한다.
-        더 처리할 대상이 없으면(상자 영역 마스킹 포함) **빈 리스트**를 반환해야 한다 —
-        `SCAN` 은 빈 리스트를 '남은 대상 없음'으로 해석해 `DONE` 으로 전이한다.
+    def identify_target(self) -> TargetObservation | None:
+        """정면에서 집을 물체를 자기 뎁스 카메라로 관측한다.
 
-        **실패(서비스 부재 · 응답 없음)도 빈 리스트.** 관측이 안 되는데 계속 도는
-        것보다 미션을 끝내고 이유를 로그로 남기는 편이 낫다."""
+        raw YOLO 라벨과 함께 **전방 거리·좌우 오프셋**을 낸다 — GRASP 진입
+        판정이 "물체가 턱이 쓸고 갈 영역 안에 있는가"를 재려면 라벨만으로는
+        부족하기 때문이다(domain/task/grasp_alignment.py).
 
-    @abstractmethod
-    def find_box(self, dest: Destination) -> BoxObservation | None:
-        """지정한 목적지(왼쪽/오른쪽) 바구니를 관측한다. 찾지 못하면 **`None`** 을
-        반환해야 한다 — `TRANSPORT` 는 `None` 을 받으면 대상을 보류 등록하고
-        `SCAN` 으로 복귀한다. 서비스 부재 · 응답 없음도 같은 `None` 이다.
+        **못 찾거나 확신할 수 없으면 `None`** — GRASP 조건 판정이 그걸
+        미충족으로 읽어 Host에 되돌려준다(preconditions.check_grasp).
+        찾았지만 거리를 환산 못 했으면 `metric_ok=False`로 돌려준다.
 
-        ⚠️ 2026-08-23 확정 미션 명세서: 바구니 좌표는 하드코딩이고 색 탐색은
-        하지 않는다. 그래도 이 메서드가 남아 있는 이유는, 하드코딩된 좌표
-        근처에서 실제 바구니 자세(opening_mm·long_axis_rad 등 INSERT가 쓰는
-        정밀값)를 확인하는 역할까지는 아직 없애지 않았기 때문이다 — "색으로
-        어디 있는지 찾는다"에서 "위치는 이미 알고, 그 자리의 상세를 잰다"로
-        의미가 바뀌었을 뿐이다."""
+        왜 Pi가 이걸 하는가. 2026-08-26 팀 확정으로 Host 명령에는 좌표도
+        라벨도 없다(state와 속도 넷뿐). 그런데 **내려가는 것은 이 팔**이고,
+        어떤 교시 자세로 내려갈지는 무엇을 집는지에 달려 있다. 그래서
+        "무엇이 앞에 있는가"만은 Pi가 자기 눈으로 확인한다.
 
-    @abstractmethod
-    def measure_opening(self, box: BoxObservation) -> float | None:
-        """`box` 앞에 정렬한 상태에서 입구 폭(mm)을 정밀 실측한다.
-        `POSE_PLAN` 이 이 값으로 φ 해 구간을 계산한다.
-
-        **실측하지 못하면(서비스 부재 · 응답 없음) `None`** — '해 없음' 취급이라
-        `POSE_PLAN` 이 `REJECT` 로 보낸다. 입구 폭을 모르는 채로 투입을 시도하면
-        상자 테두리에 물체를 찍는다."""
+        Host의 Geti 모델과 충돌하지 않는다 — 저쪽은 아레나 전체에서 목표를
+        고르는 일이고, 이쪽은 이미 정해진 목표를 코앞에서 확인하는 일이다.
+        훈련 데이터부터 다르다(이 모델은 로봇 시점 합성 데이터로 배웠다)."""
 
     @abstractmethod
     def monitor_clearance(self) -> Clearance:
@@ -52,15 +42,32 @@ class Perception(ABC):
         계약 위반이 아니다 (`ScriptedPerception.monitor_clearance` 참고)."""
 
     @abstractmethod
+    def remember_target(self, raw_cls: str) -> bool:
+        """GRASP 로 내려가기 **직전에** 목표 물체를 기억해 둔다.
+
+        `confirm_grasp()` 가 "그때 거기 있던 것이 지금은 없다"를 판정하려면
+        기준이 필요하다. 기억에 실패하면(관측 불가 등) **`False`** — 그 뒤의
+        `confirm_grasp()` 는 비교 기준이 없으므로 판정을 포기한다.
+        """
+
+    @abstractmethod
     def confirm_grasp(self) -> bool:
-        """그리퍼 캠으로 손끝에 물체가 실제로 물려 있는지 시각 확인한다.
+        """CARRY_IDLE 에서 정면을 다시 보고 목표 물체가 사라졌는지 확인한다.
 
-        ⚠️ 2026-08-21 기준 1단계(로깅 전용)다. `GraspState` 는 이 값을 아직
-        성공 판정에 쓰지 않는다 — `get_load()` 의 `LOAD_THRESHOLD` 처럼 실측으로
-        검증된 임계값이 이 신호에는 아직 없어서다. load 임계값을 n=25 실측으로
-        잡았던 것과 같은 절차(GraspState 주석 참고)를 거친 뒤에만 성공 판정에
-        편입한다.
+        원리 — **부재가 증거다.** 파지에 성공했으면 물체는 바닥에서 사라져
+        그리퍼에 있다. 실패했으면 여전히 바닥에 있다. 그리퍼캠으로 "손끝에
+        물려 있는가"를 보려던 예전 방식은 실측으로 무효였다(빈 그리퍼 닫힘
+        165990px² 가 룩을 문 상태 70384px² 보다 컸다). 물체가 있던 자리를
+        보는 쪽이 훨씬 다루기 쉬운 신호다.
 
-        **서비스 부재 · 응답 없음도 `False`** — 다른 관측 포트와 같은 "모르면
-        실패" 관례를 따른다. 신뢰도(confidence)는 이 포트 계약에 없다 — 필요한
-        만큼만 어댑터가 진단 로그로 남긴다."""
+        CARRY_IDLE 에서 팔이 depth 카메라를 가리지 않는다는 것은 2026-08-25
+        실기로 확인했다 — 팔은 프레임 밖이고 바닥이 그대로 보인다.
+
+        ⚠️ 이것만으로 성공을 단정하면 안 된다. 내려오는 그리퍼가 물체를
+        **쳐서 시야 밖으로 밀어낸** 경우에도 "사라짐"으로 보인다. load 신호와
+        **독립적인 두 번째 근거**로 쓰는 것이 이 포트의 목적이다 —
+        load 는 "무언가를 쥐었다"를, 이쪽은 "목표가 그 자리에서 없어졌다"를
+        말하므로 실패 양상이 서로 겹치지 않는다.
+
+        **관측 불가 · 기준 없음은 `False`** — 다른 관측 포트와 같은 "모르면
+        실패" 관례를 따른다."""

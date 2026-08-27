@@ -97,7 +97,29 @@ import basket_lidar_align as align  # noqa: E402
 
 # --- 실측에서 온 상수 ------------------------------------------------------
 
+# 2026-08-26엔 퀸 전용으로 하드코딩돼 있었다. 2026-08-27에 --profile로
+# 바꿀 수 있게 열었다 — main()이 argparse 뒤 이 전역을 다시 쓴다.
 PROFILE = "chess_queen"
+PROFILE_LABEL = {
+    "chess_queen": "퀸", "chess_knight": "나이트", "chess_rook": "룩",
+    "cube": "박스", "star_column": "스타", "soccer_polyhedron": "축구공",
+}
+
+
+def _eul_reul(word: str) -> str:
+    """word 뒤에 붙일 목적격 조사('을'/'를'). 받침 유무로 정한다."""
+    code = ord(word[-1]) - 0xAC00
+    if 0 <= code < 11172 and code % 28 != 0:
+        return "을"
+    return "를"
+
+
+def _i_ga(word: str) -> str:
+    """word 뒤에 붙일 주격 조사('이'/'가'). 받침 유무로 정한다."""
+    code = ord(word[-1]) - 0xAC00
+    if 0 <= code < 11172 and code % 28 != 0:
+        return "이"
+    return "가"
 
 # 2026-08-26 실기: 이 라이다 판독 거리에서 carry→drop→투하가 성공했다
 # (정면 피팅 거리 0.1386m, 잔차 2.8mm, yaw -0.87도. 나이트로 검증).
@@ -139,6 +161,18 @@ ARRIVE_TOLERANCE_M = 0.010
 # 놓친 뒤다. 절벽 바로 아래로 올려 둔다 — 정상 주행이면 절대 안 걸리고,
 # 걸렸다면 "보고 있는 게 우리가 교정한 그 면이 아니다"라는 뜻이다.
 EMERGENCY_MIN_M = 0.120
+
+# 근거리 안전 구멍(2026-08-26 실기분석 §5/§9): 라이다 빔이 테두리를 넘어가면
+# 판독값이 "멀어지는" 방향으로 거짓말한다 — 바구니 뒤 벽까지의 거리이거나
+# math.inf다. 둘 다 값이 커지므로, EMERGENCY_MIN_M처럼 "판독값이 작으면
+# 멈춘다"는 규칙은 원리적으로 이 실패 모드를 못 잡는다.
+#
+# 대신 이 거리(CLIFF_WATCH_M) 안쪽부터는 "전진했는데 판독값이 커졌다"와
+# "가까이서 정면 피팅을 놓쳤다" 두 신호로 직접 잡는다 — 절벽을 넘는 순간
+# (전환 즉시) 잡는 가장 이른 방어선이다(같은 분석 §9의 후보 3번·2번을
+# 함께 적용). CLIFF_JUMP_M은 정상 잔차(1~5mm대)보다 넉넉히 큰 여유다.
+CLIFF_WATCH_M = 0.20
+CLIFF_JUMP_M = 0.015
 
 # 실제로 바퀴가 도는 최저 속도. 낮추지 말 것 — 아래로는 아무리 오래 줘도
 # 안 움직이는데 /odom_raw는 움직였다고 보고한다(2026-08-24 실기).
@@ -367,7 +401,14 @@ class ApproachNode(Node):
     def arm_state(self):
         return self._call(self._state, GetArmState.Request(), label="get_arm_state")
 
-    def move_stage(self, stage, profile=PROFILE, timeout=60.0):
+    def move_stage(self, stage, profile=None, timeout=60.0):
+        # ⚠️ 기본 인자를 profile=PROFILE로 두면 클래스 정의 시점(=import
+        # 시점)의 값(chess_queen)에 영구히 고정된다 — main()이 나중에
+        # 전역 PROFILE을 바꿔도 이 함수의 기본값은 안 따라온다(파이썬
+        # 기본 인자는 def 시점에 한 번만 평가된다, servo1_offset_for의
+        # 같은 함정 참고). 그래서 여기서 매 호출마다 전역을 다시 읽는다.
+        if profile is None:
+            profile = PROFILE
         if not self._floor.wait_for_server(timeout_sec=10.0):
             raise RuntimeError("move_to_floor_pose 액션 서버 없음")
         goal = MoveToFloorPose.Goal()
@@ -428,13 +469,14 @@ def preflight(node):
 
 
 def phase_grasp(node, keys):
+    label = PROFILE_LABEL.get(PROFILE, PROFILE)
     print()
     print(BANNER)
-    print("1단계 · 퀸 파지  (바구니에서 약 50cm 떨어진 자리)")
+    print(f"1단계 · {label} 파지  (바구니에서 약 50cm 떨어진 자리)")
     print(BANNER)
     profile = FLOOR_GRASP_PROFILES[PROFILE]
 
-    keys.wait_enter("  퀸을 차체 전면 19cm 정면에 놓고 Enter (q로 종료) > ")
+    keys.wait_enter(f"  {label}{_eul_reul(label)} 차체 전면 19cm 정면에 놓고 Enter (q로 종료) > ")
 
     print("  토크 켜는 중...")
     node.hold_position()
@@ -476,7 +518,7 @@ def phase_grasp(node, keys):
     print(f"  응답 ok={response.ok}  응답 부하={response.load_ratio:.4f}  "
           f"정착 부하={settled:.4f}  ({verdict}, 참고선 {GRASP_LOAD_HINT})")
 
-    keys.wait_enter("  퀸이 제대로 물렸는지 눈으로 확인하고 Enter (q로 종료) > ")
+    keys.wait_enter(f"  {label}{_i_ga(label)} 제대로 물렸는지 눈으로 확인하고 Enter (q로 종료) > ")
 
     print("  grasp → safe (midpoint 경유) ...")
     node.move_stage("safe")
@@ -509,6 +551,7 @@ def phase_approach(node, keys):
     print("   #   경과    라이다     남음   yaw     잔차   폭    점   좌우    뎁스        상태")
     travelled = 0.0
     started = time.time()
+    prev_distance = None   # 절벽 감시용 — 직전 사이클 판독 거리
 
     for cycle in range(1, MAX_CYCLES + 1):
         node.pump(SETTLE_S)
@@ -531,6 +574,25 @@ def phase_approach(node, keys):
               f"{fit.residual_m * 1000:4.1f}mm  {fit.face_width_m * 1000:3.0f}  "
               f"{fit.point_count:3d}  {_lateral_str(fit)}  {depth_str}  {source}"
               + ("" if fit.ok else f"  [{fit.reason}]"))
+
+        # 근거리 절벽 방어 — EMERGENCY_MIN_M 검사보다 먼저 본다. "작아지면
+        # 멈춘다"는 그 규칙이 못 잡는 실패 모드라서, 여기서 직접 잡는다.
+        if prev_distance is not None and prev_distance <= CLIFF_WATCH_M:
+            if not fit.ok:
+                node.stop()
+                print()
+                print(f"  ⛔ 근거리 피팅 실패 — 직전 {prev_distance:.3f}m에서 정면을 "
+                      f"잡았다가 놓쳤습니다. 절벽(빔이 테두리를 넘어감)일 수 있어 "
+                      f"멈춥니다. [{fit.reason}]")
+                return None
+            if distance > prev_distance + CLIFF_JUMP_M:
+                node.stop()
+                print()
+                print(f"  ⛔ 근거리에서 판독값이 커졌습니다 ({prev_distance:.3f}m → "
+                      f"{distance:.3f}m). 절벽을 넘었을 가능성이 있어 멈춥니다 — "
+                      f"더 가까이 가면 상황이 나빠지기만 합니다.")
+                return None
+        prev_distance = distance
 
         if distance <= EMERGENCY_MIN_M:
             node.stop()
@@ -652,17 +714,22 @@ def _fit_str(fit):
 
 
 def main():
-    global TARGET_LIDAR_M
+    global TARGET_LIDAR_M, PROFILE
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--target", type=float, default=TARGET_LIDAR_M,
                         help=f"정지할 라이다 거리 m (기본 {TARGET_LIDAR_M})")
+    parser.add_argument("--profile", default=PROFILE,
+                        choices=sorted(FLOOR_GRASP_PROFILES.keys()),
+                        help=f"파지 프로파일 (기본 {PROFILE}) — 2026-08-27까지 퀸만 "
+                             "실기 검증됨, 나머지는 오늘 처음 이 도구로 돎")
     parser.add_argument("--skip-grasp", action="store_true",
-                        help="이미 퀸을 물고 CARRY에 있을 때 2단계부터 시작")
+                        help="이미 물체를 물고 CARRY에 있을 때 2단계부터 시작")
     parser.add_argument("--monitor-only", action="store_true",
                         help="주행·팔 없이 라이다/뎁스 측정만 1초마다 출력")
     args = parser.parse_args()
     TARGET_LIDAR_M = args.target
+    PROFILE = args.profile
 
     if os.environ.get("ROS_DOMAIN_ID") != "21":
         print("⚠️ ROS_DOMAIN_ID가 21이 아닙니다 — 노드가 서로 안 보입니다.", file=sys.stderr)
@@ -691,7 +758,9 @@ def main():
             phase_insert(node, keys)
             print()
             print(BANNER)
-            print("완료. 퀸이 바구니 안에 들어갔는지 눈으로 확인해 주세요.")
+            _label = PROFILE_LABEL.get(PROFILE, PROFILE)
+            print(f"완료. {_label}{_i_ga(_label)} 바구니 안에 "
+                  "들어갔는지 눈으로 확인해 주세요.")
             print(BANNER)
             return 0
     except KeyboardInterrupt:

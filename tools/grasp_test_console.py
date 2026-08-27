@@ -127,13 +127,16 @@ from grippers_arm.gripper_calibration import GRIPPER_CLOSED_MM
 # 핫스팟 실기 실측). distance_m = K_CLASS / sqrt(bbox_area_px), bbox_area_px
 # = h*w. None은 미실측 클래스(box, star) — 이 스크립트는 해당 클래스에서
 # 전방/좌우 cm 계산을 건너뛴다.
+#
+# ⚠️ 2026-08-27: queen이 여기서 두 번(2026-08-26, 2026-08-27) 안 갈아 끼워진
+# 채로 남아 있었다 — perception_node.py를 고칠 때마다 이 사본도 같이 고칠 것.
 K_CLASS = {
-    "knight": 35.9307,
-    "queen": 28.3382,
-    "rook": 34.8340,
-    "box": None,
-    "soccer": 18.9592,
-    "star": None,
+    "knight": 39.5578,
+    "queen": 38.3357,
+    "rook": 37.7658,
+    "box": 23.2733,
+    "soccer": 25.8794,
+    "star": 24.1690,
 }
 # 2026-08-24: 거리 모델을 z = K/sqrt(hw)에서 z = K/(sqrt(hw) - BBOX_PADDING_PX)로
 # 바꿨다. 룩을 0.40·0.70·1.04m 세 거리에서 재니 역산 K가 35.49 -> 36.78 -> 37.40으로
@@ -244,7 +247,7 @@ YOLO_CAPTURE_DIR = "/grippers/recordings/yolo_captures"
 # 캡처에 쓰는 모델과 perception_node가 판단에 쓰는 모델이 다르면 이 콘솔의
 # 진단값을 믿을 수 없다. /tmp가 아니라 바인드 마운트된 /grippers/models인
 # 이유는 perception_node.py의 같은 날짜 주석 참고.
-YOLO_MODEL_PATH = "/grippers/models/best_cpu.pt"
+YOLO_MODEL_PATH = "/grippers/models/best.pt"
 YOLO_CAPTURE_CONF = 0.25  # perception_node의 CONF_THRESHOLD(0.45)보다 낮게 —
                           # "왜 못 잡았나"를 보려면 탈락한 약한 검출도 보여야 한다
 RGB_WAIT_TIMEOUT_S = 5.0  # 1단계 캡처 전 프레임 대기 상한

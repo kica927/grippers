@@ -130,6 +130,60 @@ def test_베이스를_움직이지_않는다():
     assert "(0.0, 0.0, 0.0), 0.0" in _source()
 
 
+# ── 해제된 뒤 다시 잡을 수 있는가 ──────────────────────────────────────────
+#
+# 팔로워는 해제되면 `if not self.tracking: return` 에 갇힌다. 같은 epoch 로
+# engaged=True 를 아무리 보내도 다시 안 잡는다 — **새 epoch 만이 latch 를
+# 다시 건다**(follower_teleop_node.on_packet). 추론이 느려 한 번 해제되면
+# 그 뒤로 패킷은 계속 나가는데 팔은 영영 안 움직인다.
+
+
+def test_해제되면_다시_engage_하도록_표시한다():
+    src = _source()
+
+    assert "if not tick.engaged and self._engaged:" in src
+    assert "self._engaged = False" in src
+
+
+def test_engage_가_epoch_을_올린다():
+    """epoch 를 안 올리면 팔로워가 기준점을 다시 안 잡는다."""
+    tree = _tree()
+    engage = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_engage")
+
+    assert "_epoch" in ast.dump(engage)
+    assert "prime" in ast.dump(engage)
+
+
+def test_engage_가_지금_자세를_읽는다():
+    """추론이 몇 초 걸렸으므로 추론 직전의 자세는 낡았을 수 있다. 낡은
+    자세로 기준을 잡으면 팔로워가 그 차이만큼 팔을 튕긴다."""
+    tree = _tree()
+    engage = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_engage")
+
+    assert "_state" in ast.dump(engage), "현재 상태를 다시 읽어야 한다"
+
+
+# ── 속도를 섞지 않는가 ─────────────────────────────────────────────────────
+
+
+def test_액션_속도와_송신_속도가_따로_있다():
+    """청크의 한 스텝은 데이터셋 fps 짜리 움직임이고, 송신 속도는 데드맨이
+    정한다. 하나로 합치면 정책이 배운 속도로 안 움직인다."""
+    src = _source()
+
+    assert "action_hz" in src
+    assert "send_hz" in src
+
+
+def test_기본_액션_속도를_공용_모듈에서_가져온다():
+    """노드가 15 를 직접 쓰면 데이터셋 fps 가 바뀔 때 한 곳만 고쳐진다."""
+    src = _source()
+
+    assert "ACTION_HZ_DEFAULT = action_chunk.ACTION_HZ_DEFAULT" in src
+
+
 # ── 학습과 추론이 같은 세상을 봐야 한다 ────────────────────────────────────
 
 

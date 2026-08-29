@@ -14,6 +14,25 @@ SmolVLA 는 한 번 추론할 때 액션을 **한 개가 아니라 묶음으로*
 패킷을 안 보내면 데드맨이 걸린다. 그래서 **추론은 가끔, 송신은 항상**
 이어야 하고, 그 사이를 메우는 것이 이 파일이다.
 
+## 속도가 세 개다 — 섞으면 안 된다
+
+    액션 속도  action_hz   청크의 한 스텝이 원래 몇 초 간격이었나
+    송신 속도  send_hz     패킷을 몇 Hz 로 보내나
+    추론 속도  (측정값)    한 번 추론에 몇 초 걸리나
+
+**액션 속도는 데이터셋의 fps 다.** 학습 데이터를 카메라(15Hz) 기준으로
+만들었으면 청크의 한 스텝은 1/15초짜리 움직임이다. 그걸 50Hz 로 풀면
+궤적이 3.3배 빨리 돌아간다 — 정책이 배운 속도가 아니고, 슬루에 계속 걸려
+목표를 못 따라간다.
+
+**송신 속도는 데드맨과 부드러움이 정한다.** 50Hz 를 유지하되, 한 액션을
+`send_hz / action_hz` 번 반복해서 보낸다. 반복이 낭비가 아닌 이유: 슬루가
+한 틱에 80카운트만 허용하므로, 같은 목표를 여러 틱 보내는 것은 그 목표로
+**속도 제한을 걸어 다가가는 것**이 된다.
+
+이 둘을 맞추면 ③의 문제도 대부분 사라진다. 50스텝 청크가 15Hz 에서
+3.3초 분량이라, Pi CPU 추론이 2~3초여도 청크가 먼저 마르지 않는다.
+
 ## 세 가지를 여기서 지킨다
 
 **① 데드맨을 굶기지 않는다.** 보낼 새 액션이 없어도 마지막 값을 계속
@@ -54,9 +73,16 @@ from episode_spec import POS_RANGE, wrap_delta
 # 여기 값이 팔로워보다 크면 팔로워가 조용히 자른다 — 같게 두는 것이 요점이다.
 SLEW_COUNTS_DEFAULT = 80
 
-# 이보다 오래된 청크는 재생하지 않는다. 50스텝 청크를 50Hz 로 다 푸는 데
-# 1.0초가 걸리므로, 그 두 배를 넘겼다면 추론이 따라오지 못하고 있는 것이다.
-MAX_CHUNK_AGE_S_DEFAULT = 2.0
+# 액션 속도의 기본값. **데이터셋을 만든 fps 와 같아야 한다**
+# (bag_to_lerobot.FPS_DEFAULT). 다르면 정책이 배운 속도로 안 움직인다.
+ACTION_HZ_DEFAULT = 15.0
+SEND_HZ_DEFAULT = 50.0
+
+# 청크가 원래 덮는 시간을 이만큼 넘겨서까지 재생하지는 않는다. 절대 시간이
+# 아니라 여유분인 이유: 청크 길이와 액션 속도에 따라 덮는 시간이 달라지는데,
+# 절대값으로 두면 멀쩡한 청크를 중간에 끊거나(짧게 잡으면) 죽은 정책의
+# 궤적을 오래 재생한다(길게 잡으면).
+STALE_GRACE_S_DEFAULT = 1.0
 
 # 청크가 소진된 뒤 마지막 액션을 붙들고 있는 한도. 이 시간까지는 팔이 그
 # 자세로 버티고, 넘기면 해제한다.
@@ -81,11 +107,14 @@ class ChunkPlayer:
     시각은 밖에서 준다 — 테스트가 시계를 쥐고 있어야 하기 때문이다."""
 
     slew: int = SLEW_COUNTS_DEFAULT
-    max_chunk_age_s: float = MAX_CHUNK_AGE_S_DEFAULT
+    action_hz: float = ACTION_HZ_DEFAULT
+    send_hz: float = SEND_HZ_DEFAULT
+    stale_grace_s: float = STALE_GRACE_S_DEFAULT
     max_hold_s: float = MAX_HOLD_S_DEFAULT
 
     _chunk: list = field(default_factory=list)
     _cursor: int = 0
+    _repeat: int = 0            # 지금 스텝을 몇 번 더 보내야 하나
     _chunk_at: float = 0.0
     _last: list = field(default_factory=list)   # 마지막으로 보낸 목표
     # 청크를 다 쓴 시각. **0.0 이 아니라 None 이 '아직 아님'이다** — 0.0 을
@@ -94,11 +123,27 @@ class ChunkPlayer:
     _exhausted_at: float | None = None
     clamped_total: int = 0
 
+    @property
+    def ticks_per_action(self) -> int:
+        """한 액션을 몇 틱 동안 보낼 것인가 = send_hz / action_hz.
+
+        1 미만으로 내려가지 않는다 — 액션을 건너뛰면 정책이 낸 궤적의
+        일부를 버리는 것이고, 그건 속도를 맞추는 것과 다른 일이다."""
+        if self.action_hz <= 0:
+            return 1
+        return max(1, int(round(self.send_hz / self.action_hz)))
+
+    def chunk_duration_s(self, steps: int | None = None) -> float:
+        """청크가 원래 덮는 시간."""
+        n = len(self._chunk) if steps is None else steps
+        return n / self.action_hz if self.action_hz > 0 else 0.0
+
     def submit(self, chunk, now: float) -> None:
         """새 청크로 갈아 끼운다. 남은 옛 청크는 버린다 — 새 관측으로 낸
         것이 언제나 더 옳다."""
         self._chunk = [list(a) for a in chunk]
         self._cursor = 0
+        self._repeat = 0
         self._chunk_at = now
         self._exhausted_at = None
 
@@ -116,14 +161,21 @@ class ChunkPlayer:
     def tick(self, now: float) -> Tick:
         age = now - self._chunk_at if self._chunk else float("inf")
 
-        # ③ 오래된 청크는 안 쓴다.
-        if self._chunk and age > self.max_chunk_age_s:
+        # ③ 오래된 청크는 안 쓴다. 기준은 절대 시간이 아니라 **청크가 원래
+        #    덮는 시간 + 여유**다 — 그래야 청크가 길어져도 중간에 안 끊긴다.
+        if self._chunk and age > self.chunk_duration_s() + self.stale_grace_s:
             return Tick(list(self._last), False,
                         f"청크가 {age:.1f}초 낡음 — 추론이 따라오지 못한다")
 
         if self.remaining > 0:
             want = self._chunk[self._cursor]
-            self._cursor += 1
+            # 같은 액션을 ticks_per_action 번 보낸다. 낭비가 아니다 —
+            # 슬루가 한 틱에 80카운트만 허용하므로, 같은 목표를 여러 틱
+            # 보내는 것이 그 목표로 속도 제한을 걸어 다가가는 것이다.
+            self._repeat += 1
+            if self._repeat >= self.ticks_per_action:
+                self._cursor += 1
+                self._repeat = 0
             if self.remaining == 0:
                 self._exhausted_at = now
             return self._emit(want)

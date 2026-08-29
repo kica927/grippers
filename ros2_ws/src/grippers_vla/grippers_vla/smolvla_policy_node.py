@@ -77,6 +77,12 @@ STATE_TOPIC_DEFAULT = "teleop/follower_present"
 # 보낸다고 팔이 더 부드러워지지는 않는다 — 서보 쓰기가 병목이다.
 SEND_HZ_DEFAULT = 50.0
 
+# 청크의 한 스텝이 원래 몇 Hz 짜리였나 = **데이터셋을 만든 fps**.
+# 송신 속도와 다른 값이다(action_chunk.py 의 "속도가 세 개다" 참고).
+# 여기를 데이터셋과 다르게 두면 정책이 배운 속도로 안 움직이는데, 증상이
+# "좀 이상하다" 뿐이라 원인을 찾기 어렵다.
+ACTION_HZ_DEFAULT = action_chunk.ACTION_HZ_DEFAULT
+
 # 관측이 이보다 오래되면 추론하지 않는다. 카메라가 15Hz 이므로 0.5초는
 # 7프레임 넘게 빠졌다는 뜻이고, 그건 카메라가 멈춘 것이다.
 OBS_STALE_S = 0.5
@@ -92,6 +98,7 @@ class SmolvlaPolicyNode(Node):
         self.declare_parameter("follower_host", "127.0.0.1")
         self.declare_parameter("follower_port", DEFAULT_PORT)
         self.declare_parameter("send_hz", SEND_HZ_DEFAULT)
+        self.declare_parameter("action_hz", ACTION_HZ_DEFAULT)
         self.declare_parameter("device", "cpu")
         self.declare_parameter("dry_run", True)
 
@@ -105,7 +112,9 @@ class SmolvlaPolicyNode(Node):
         self._state = None          # 최신 실측 자세 (관절 6개)
         self._state_at = 0.0
 
-        self._player = action_chunk.ChunkPlayer()
+        self._action_hz = float(self.get_parameter("action_hz").value)
+        self._player = action_chunk.ChunkPlayer(
+            action_hz=self._action_hz, send_hz=self._send_hz)
         self._engaged = False
         self._epoch = 0
         self._seq = 0
@@ -132,7 +141,10 @@ class SmolvlaPolicyNode(Node):
         if self._dry_run:
             self.get_logger().warn(
                 "--dry-run: 계산만 하고 engaged=False 로 보냅니다 — 팔은 안 움직입니다")
-        self.get_logger().info(f"정책 노드 준비 — 팔로워 {self._addr}")
+        self.get_logger().info(
+            f"정책 노드 준비 — 팔로워 {self._addr} · 송신 {self._send_hz:.0f}Hz "
+            f"· 액션 {self._action_hz:.0f}Hz "
+            f"(한 액션을 {self._player.ticks_per_action}틱 보냅니다)")
 
     # ── 관측 ────────────────────────────────────────────────────────────────
 
@@ -283,11 +295,22 @@ class SmolvlaPolicyNode(Node):
                 f"추론 {took * 1000:.0f}ms · 청크 {len(actions)}스텝 "
                 f"({len(actions) / self._send_hz:.1f}초 분량)")
 
-    def _engage(self, state, now):
+    def _engage(self, fallback_state, now):
         """추종을 켠다 — 팔로워가 현재 자세를 기준점으로 잡게 만든다.
 
         먼저 현재 실측 자세를 ChunkPlayer 에 심고 epoch 를 올린다. 이
-        순서를 바꾸면 첫 패킷이 기준점 없이 나가 팔이 튄다."""
+        순서를 바꾸면 첫 패킷이 기준점 없이 나가 팔이 튄다.
+
+        **epoch 를 올리는 것이 재개의 전부다.** 팔로워는 해제된 뒤
+        `if not self.tracking: return` 에 갇혀 있어서, 같은 epoch 로
+        engaged=True 를 아무리 보내도 다시 안 잡는다
+        (follower_teleop_node.on_packet). 새 epoch 만이 latch 를 다시
+        건다. 그래서 해제될 때마다 여기를 다시 지나야 한다.
+
+        기준 자세는 **지금** 읽은 것을 쓴다. 추론이 몇 초 걸렸으므로
+        추론 직전의 자세는 낡았을 수 있다."""
+        with self._lock:
+            state = list(self._state) if self._state else list(fallback_state)
         self._player.prime(state)
         self._epoch += 1
         self._engaged = True
@@ -308,6 +331,12 @@ class SmolvlaPolicyNode(Node):
                 last_reason = tick.reason
             elif not tick.reason:
                 last_reason = ""
+
+            # 해제됐으면 다음 청크에서 **반드시** 다시 engage 해야 한다.
+            # 안 그러면 팔로워가 tracking=False 로 갇혀, 우리가 계속
+            # 패킷을 보내는데도 팔이 영영 안 움직인다.
+            if not tick.engaged and self._engaged:
+                self._engaged = False
 
             engaged = bool(tick.engaged) and self._engaged and not self._dry_run
             pos = tick.counts if tick.counts else [None] * episode_spec.JOINT_COUNT

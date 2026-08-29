@@ -120,6 +120,8 @@ class SmolvlaPolicyNode(Node):
                       int(self.get_parameter("follower_port").value))
 
         self._policy = None
+        self._pre = None
+        self._post = None
         self._sender = threading.Thread(target=self._send_loop, daemon=True)
         self._infer = threading.Thread(target=self._infer_loop, daemon=True)
 
@@ -165,49 +167,81 @@ class SmolvlaPolicyNode(Node):
     # ── 추론 ────────────────────────────────────────────────────────────────
 
     def _load_policy(self):
+        """정책과 **전·후처리기를 같이** 연다.
+
+        ⚠️ LeRobot 0.4.x 는 정규화가 정책 밖으로 빠져 있다. 정책만 열고
+        predict_action_chunk 를 부르면
+
+          · 관측: 원시 카운트(약 2048)가 정규화 없이 그대로 들어간다.
+            정책은 학습 때 본 적 없는 크기의 숫자를 본다.
+          · 액션: 정규화된 값이 그대로 나온다. 그걸 서보 목표로 보내면
+            팔이 엉뚱한 곳으로 간다.
+
+        둘 다 예외 없이 조용히 틀린다. 그래서 make_pre_post_processors 로
+        체크포인트에 같이 저장된 파이프라인을 반드시 같이 연다
+        (lerobot/async_inference/policy_server.py 가 하는 것과 같은 순서)."""
         path = self.get_parameter("policy_path").value
         if not path:
             raise RuntimeError(
                 "policy_path 가 비어 있습니다 — 학습한 SmolVLA 체크포인트 경로를 주세요.\n"
                 "  아직 학습 전이라면 tools/vla/README.md 의 수집->변환->학습 순서를 보세요.")
+        from lerobot.policies.factory import make_pre_post_processors
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
         device = self.get_parameter("device").value
         policy = SmolVLAPolicy.from_pretrained(path)
         policy.to(device)
         policy.eval()
-        self.get_logger().info(f"정책 적재 완료: {path} ({device})")
-        return policy
+        override = {"device_processor": {"device": device}}
+        pre, post = make_pre_post_processors(
+            policy.config, pretrained_path=path,
+            preprocessor_overrides=override, postprocessor_overrides=override)
+        self.get_logger().info(f"정책·전후처리기 적재 완료: {path} ({device})")
+        return policy, pre, post
 
     def _infer_loop(self):
         try:
-            self._policy = self._load_policy()
+            self._policy, self._pre, self._post = self._load_policy()
         except Exception as exc:                       # noqa: BLE001
             self.get_logger().error(f"정책을 못 띄웁니다 — {exc}")
             self._stop.set()
             return
 
         import torch
-        device = self.get_parameter("device").value
+        from lerobot.policies.utils import prepare_observation_for_inference
+
+        device = torch.device(self.get_parameter("device").value)
         while not self._stop.is_set():
             obs = self._observation()
             if obs is None:
                 time.sleep(0.05)
                 continue
             image, state = obs
-            batch = {
-                "observation.images.gripper": torch.from_numpy(
-                    np.ascontiguousarray(image)).permute(2, 0, 1)[None].to(device).float() / 255.0,
-                "observation.state": torch.tensor(
-                    state, dtype=torch.float32, device=device)[None],
-                "task": [self._task],
-            }
+            # 이미지는 HWC uint8 로 넘긴다 — prepare_observation_for_inference 가
+            # /255, CHW 변환, 배치 차원, 디바이스 이동, task/robot_type 삽입을
+            # 한다. ascontiguousarray 가 필요한 이유: BGR->RGB 를 [:, :, ::-1]
+            # 로 했으므로 stride 가 음수이고, torch.from_numpy 는 음수 stride 를
+            # 받지 않는다.
+            batch = prepare_observation_for_inference(
+                {
+                    "observation.images.gripper": np.ascontiguousarray(image),
+                    "observation.state": np.asarray(state, dtype=np.float32),
+                },
+                device, task=self._task)
+
             t0 = time.monotonic()
             with torch.inference_mode():
-                chunk = self._policy.predict_action_chunk(batch)
+                chunk = self._policy.predict_action_chunk(self._pre(batch))
+                # 후처리기는 한 스텝씩 (B, action_dim) 을 받는다 — 청크를
+                # 통째로 넣으면 안 된다. 여기서 정규화가 풀려 원시 카운트가
+                # 된다(policy_server._predict_action_chunk 와 같은 방식).
+                steps = torch.stack(
+                    [self._post(chunk[:, i, :]) for i in range(chunk.shape[1])],
+                    dim=1).squeeze(0)
             took = time.monotonic() - t0
 
-            actions = [[int(round(v)) for v in row]
-                       for row in chunk[0].detach().cpu().numpy()]
+            actions = [[int(round(float(v))) for v in row]
+                       for row in steps.detach().cpu().numpy()]
             now = time.monotonic()
             if not self._engaged:
                 self._engage(state, now)

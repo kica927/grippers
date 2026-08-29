@@ -226,7 +226,12 @@ def lerobot_features(image_keys: list, image_shape: tuple = (480, 640, 3)) -> di
     """LeRobotDataset.create 에 넘길 features.
 
     이름은 LeRobot 규약을 그대로 따른다 — `observation.images.<이름>`,
-    `observation.state`, `action`. SmolVLA 는 이 이름으로 찾는다."""
+    `observation.state`, `action`. SmolVLA 는 이 이름으로 찾는다
+    (policies/smolvla/modeling_smolvla.py:prepare_images 가
+    config.image_features 에 있는 키를 batch 에서 찾는다).
+
+    ⚠️ lerobot 0.4.4 기준이다. 0.3.x 에서 정규화가 정책 밖 프로세서로
+    옮겨 갔으므로 버전을 내리면 여기와 정책 노드가 같이 깨진다."""
     features = {
         "observation.state": {
             "dtype": "float32",
@@ -243,6 +248,8 @@ def lerobot_features(image_keys: list, image_shape: tuple = (480, 640, 3)) -> di
         features[f"observation.images.{key}"] = {
             "dtype": "video",
             "shape": tuple(image_shape),
-            "names": ["height", "width", "channel"],
+            # lerobot 정본과 같은 철자를 쓴다(datasets/utils.py:661).
+            # 그쪽은 names[2] 를 보고 (h,w,c) -> (c,h,w) 로 바꾼다.
+            "names": ["height", "width", "channels"],
         }
     return features

@@ -166,12 +166,20 @@ python3 tools/vla/bag_to_lerobot.py <bag> --repo-id kica927/grippers-pick --task
 파이에서 하지 않습니다. 맥이나 GPU 가 있는 기계에서 합니다.
 
 ```
-pip install lerobot
+pip install "lerobot==0.4.4"
 lerobot-train --policy.path=lerobot/smolvla_base --dataset.repo_id=kica927/grippers-pick --batch_size=64 --steps=20000 --output_dir=outputs/smolvla-grippers
 ```
 
 `lerobot/smolvla_base` 에서 파인튜닝합니다. 밑바닥부터 학습하지 않습니다 —
 에피소드 수십 개로는 어림도 없습니다.
+
+### ⚠️ 버전을 고정하는 이유
+
+**이 코드는 lerobot 0.4.4 를 읽고 짰습니다.** 0.3.x 에서 **정규화가 정책
+밖 전·후처리기로 옮겨 갔고**, 그 전후로 추론 호출 방식이 다릅니다. 버전을
+내리면 정책 노드가 조용히 틀린 값을 내보냅니다 — 예외가 안 납니다.
+
+학습한 기계와 파이의 lerobot 버전이 같아야 합니다.
 
 ---
 
@@ -224,7 +232,7 @@ latch 된 채 남습니다.
 
 ## 검증한 것과 못 한 것
 
-**하드웨어 없이 검증했습니다** (`tests/test_vla_*.py`, 48개)
+**하드웨어 없이 검증했습니다** (`tests/test_vla_*.py`, 71개)
 
 - 카운트가 0/4095 를 넘을 때 큰 움직임으로 오해하지 않는다
 - 추종이 꺼진 구간과 latch 직후 튐이 학습에 안 들어간다
@@ -234,6 +242,27 @@ latch 된 채 남습니다.
 - 낡은 청크로 팔을 움직이지 않는다
 - 정책 노드가 서보를 직접 열지 않는다
 - 학습과 추론의 색 순서(RGB)가 같다
+- 녹화 한 벌이 프레임이 되기까지의 배관 전체 — 세 토픽을 카메라 시계에
+  맞추고, 관절별로 펴고, 추종 구간만 잘라내는 순서 (bag 리더를 갈아 끼워
+  ROS 없이 돌립니다)
+- 못 쓰는 녹화를 못 쓴다고 말한다 — 영상 없음 · 추종 안 켬 · 실측 자세 없음
+
+**소스를 읽어 확인했습니다** (lerobot 0.4.4 휠, 2026-08-30)
+
+실행이 아니라 **소스 대조**입니다. 그래도 적어 두는 이유는, 여기서 틀리면
+학습을 다 끝낸 뒤 실기 당일에야 드러나기 때문입니다.
+
+| 확인한 것 | 어디서 |
+|---|---|
+| 정책과 전·후처리기를 같이 연다 | `async_inference/policy_server.py:154-166` |
+| 후처리기는 스텝마다 `(B, action_dim)` | 같은 파일 `_predict_action_chunk` |
+| `predict_action_chunk` → `(B, T, D)` | `policies/smolvla/modeling_smolvla.py:311` |
+| `add_frame(frame)` — `task` 는 프레임 안의 키 | `datasets/lerobot_dataset.py:1171`, `datasets/utils.py:986` |
+| 피처 이름 `["height","width","channels"]` | `datasets/utils.py:661` |
+| 이미지는 [0,1] float, CHW, 배치차원 | `policies/utils.py:98` |
+
+`tests/test_vla_lerobot_contract.py` 가 이 호출들을 못 박습니다 — 누가
+'정리'하면 그때 걸립니다.
 
 **실기로 확인하지 못했습니다**
 

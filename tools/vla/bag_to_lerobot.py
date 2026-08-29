@@ -97,21 +97,35 @@ def _counts(msgs: list) -> list:
 
 
 def _unwrap_per_joint(series: list) -> list:
-    """관절별로 따로 편다. 프레임별 리스트 -> 관절별 수열 -> 다시 프레임별."""
+    """관절별로 따로 편다. 프레임별 리스트 -> 관절별 수열 -> 다시 프레임별.
+
+    한 프레임이 통째로 None 일 수 있다 — hold_sample 이 '아직 아무 값도 안
+    왔다'를 그렇게 표현하고, 토픽이 아예 비었으면 전부 None 이다. 그 경우
+    관절값도 전부 None 이어야 build_frames 가 그 프레임을 버린다. 여기서
+    len(None) 을 부르면 사람이 읽을 수 있는 안내 대신 TypeError 로 죽는다
+    — 그런데 이 상황(--state-period 0 으로 찍은 녹화)은 흔하다."""
     if not series:
         return []
-    by_joint = [spec.unwrap_series([f[j] if j < len(f) else None for f in series])
-                for j in range(spec.JOINT_COUNT)]
+    by_joint = [
+        spec.unwrap_series(
+            [(f[j] if f is not None and j < len(f) else None) for f in series])
+        for j in range(spec.JOINT_COUNT)
+    ]
     return [[by_joint[j][i] for j in range(spec.JOINT_COUNT)]
             for i in range(len(series))]
 
 
-def analyse(bag: Path, top_camera: str | None, storage_id: str = "sqlite3"):
-    """bag 을 읽어 프레임 목록과 보고서를 만든다. 데이터셋은 안 쓴다."""
+def analyse(bag: Path, top_camera: str | None, storage_id: str = "sqlite3",
+            reader=None):
+    """bag 을 읽어 프레임 목록과 보고서를 만든다. 데이터셋은 안 쓴다.
+
+    `reader` 를 주면 그것으로 읽는다 — 테스트가 ROS 없이 이 배관 전체를
+    돌리기 위한 자리다. 순수 함수만 검증하고 그것들을 엮는 부분을 안 보면,
+    정작 실기에서 깨지는 것은 엮은 자리다."""
     topics = [GRIPPER_TOPIC, STATE_TOPIC, ACTION_TOPIC, ENGAGED_TOPIC]
     if top_camera:
         topics.append(top_camera)
-    data = _read_bag(bag, topics, storage_id)
+    data = (reader or _read_bag)(bag, topics, storage_id)
 
     ref_t = data[GRIPPER_TOPIC]["t"]
     if not ref_t:
@@ -177,7 +191,12 @@ def write_dataset(frames, data, ref_t, args) -> None:
 
     for ep, rows in frames:
         for row in rows:
+            # `task` 는 add_frame 의 인자가 아니라 **프레임 안의 키**다
+            # (lerobot 0.4.4 datasets/utils.py:validate_frame — 없으면
+            # ValueError, 인자로 주면 TypeError). 에피소드마다 같은 문장을
+            # 쓴다: SmolVLA 는 이 문장을 언어 입력으로 읽는다.
             frame = {
+                "task": args.task,
                 "observation.state": np.array(row.state, dtype=np.float32),
                 "action": np.array(row.action, dtype=np.float32),
                 "observation.images.gripper": _decode(
@@ -187,7 +206,7 @@ def write_dataset(frames, data, ref_t, args) -> None:
                 if top[row.ref_index] is None:
                     continue
                 frame["observation.images.top"] = _decode(top[row.ref_index])
-            ds.add_frame(frame, task=args.task)
+            ds.add_frame(frame)
         ds.save_episode()
         print(f"  에피소드 #{ep.index} 저장 — 프레임 {len(rows)}개")
 
@@ -211,7 +230,7 @@ def main() -> int:
     if not args.bag.exists():
         raise SystemExit(f"없는 경로: {args.bag}")
 
-    frames, report, data, ref_t = analyse(args.bag, args.top_camera, args.storage)
+    frames, report, data, ref_t = analyse(args.bag, args.top_camera, args.storage)  # noqa: E501
     print(f"기준 프레임(그리퍼캠) {len(ref_t)}개 · {ref_t[-1] - ref_t[0]:.1f}초")
     print(report.summary())
 

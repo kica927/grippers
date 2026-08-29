@@ -35,6 +35,18 @@ from teleop_protocol import DEFAULT_PORT, decode, wrap_delta  # noqa: E402
 # 사람이 리더를 들고 만들 수 있는 자세 변화가 아니다.
 MAX_DELTA_COUNTS = 1400
 
+# 팔로워 실측 자세를 읽는 주기. **매 패킷마다 읽지 않는다.**
+#
+# get_all_positions() 은 서보 6개에 순차 왕복 읽기를 한다(driver_sdk:495) —
+# sync read 가 아니다. 50Hz 루프는 한 틱이 20ms 인데 거기엔 이미 쓰기 6회가
+# 들어 있다. 읽기 6회를 더 얹으면 버스 예산을 넘겨 텔레옵 자체가 끊길 수
+# 있다. VLA 데이터셋은 카메라(15Hz)에 맞춰 만들므로 그보다 빨리 읽을 이유도
+# 없다.
+#
+# ⚠️ 이 값은 실기에서 확인하지 않았다. 텔레옵이 버벅이면 먼저 이것을
+# --state-period 로 늘리거나 0 으로 꺼 볼 것.
+STATE_PERIOD_SEC_DEFAULT = 1.0 / 15.0
+
 
 def clamp_to_limits(sid: int, raw: int) -> int:
     """관절의 보정 창(calibration window) 안으로 목표를 가둔다.
@@ -58,6 +70,7 @@ class FollowerTeleop:
         self.last_rx = 0.0
         self.tracking = False
         self.ros = None
+        self.last_state_read = 0.0   # 팔로워 실측 자세를 마지막으로 읽은 때
 
     # ── 시작/종료 ────────────────────────────────────────────────────────────
     def connect(self) -> bool:
@@ -121,6 +134,12 @@ class FollowerTeleop:
             if self.tracking:
                 print(f"[팔로워] 팔 추종 정지 #{self.epoch} — 현재 자세로 고정")
                 self.tracking = False
+                # 해제를 반드시 토픽으로 남긴다. 이 줄이 없으면
+                # /teleop/engaged 에는 True 만 흘러서, 나중에 bag 을 읽는
+                # 쪽이 에피소드가 어디서 끝났는지 알 수 없다 — 조작자가
+                # 손을 뗀 뒤의 표류 구간이 학습 데이터에 섞인다.
+                if self.ros:
+                    self.ros.publish_arm(msg["pos"], self.last_target, False)
             return
         if msg["epoch"] != self.epoch:
             self.latch(msg)
@@ -151,17 +170,37 @@ class FollowerTeleop:
             self.last_target[sid] = pos
 
         if self.ros:
-            self.ros.publish_arm(msg["pos"], self.last_target, True)
+            self.ros.publish_arm(msg["pos"], self.last_target, True,
+                                 present=self.read_present())
+
+    def read_present(self):
+        """VLA 데이터셋의 observation.state — 주기를 넘겼을 때만 읽는다.
+
+        읽을 차례가 아니면 None 을 돌려주고, 브리지는 그때 토픽을 내지
+        않는다. 명령(follower_counts)은 매 패킷 나가므로 기록이 끊기지
+        않는다 — 여기서 아끼는 것은 직렬 버스이지 기록이 아니다."""
+        if self.args.state_period <= 0.0:
+            return None
+        now = time.monotonic()
+        if now - self.last_state_read < self.args.state_period:
+            return None
+        self.last_state_read = now
+        cur = self.drv.get_all_positions()
+        return {sid: cur.get(sid) for sid in JOINT_IDS if cur.get(sid) is not None}
 
     # ── 데드맨 ───────────────────────────────────────────────────────────────
     def on_signal_lost(self):
         """리더가 조용해졌다. 베이스는 **반드시** 세우고, 팔은 추종만 멈춘다.
+
+        신호 끊김도 에피소드의 끝이다 — engaged=False 를 남긴다.
 
         팔의 토크는 켠 채로 둬서 그 자리에 서 있게 한다. 여기서 토크를 끄면
         들고 있던 물건과 함께 팔이 그대로 떨어진다. 베이스는 정반대다 —
         속도 명령을 유지하면 로봇이 계속 굴러가므로 즉시 0을 내야 한다."""
         if self.ros:
             self.ros.stop_base()
+            if self.tracking:
+                self.ros.publish_arm([None] * len(JOINT_IDS), self.last_target, False)
         self.tracking = False
 
     # ── 메인 루프 ────────────────────────────────────────────────────────────
@@ -206,6 +245,9 @@ def main():
                     help="리더 변화량 대비 팔로워 변화량 배율")
     ap.add_argument("--slew", type=int, default=80,
                     help="한 패킷당 관절 최대 이동 카운트 (50Hz에서 80 ≈ 350°/s)")
+    ap.add_argument("--state-period", type=float, default=STATE_PERIOD_SEC_DEFAULT,
+                    help="팔로워 실측 자세를 읽는 최소 간격(초). 0 이면 안 읽는다 "
+                         "— VLA 데이터셋의 observation.state 가 비게 된다")
     ap.add_argument("--deadman", type=float, default=0.4,
                     help="이 시간(초) 동안 패킷이 없으면 베이스 정지·팔 추종 해제")
     ap.add_argument("--relax-on-exit", action="store_true",

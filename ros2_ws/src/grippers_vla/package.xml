@@ -3,12 +3,17 @@
 <package format="3">
   <name>grippers_vla</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>SmolVLA 정책을 텔레옵 팔로워에 물리는 노드 (스트레치)</description>
   <maintainer email="11306260+liangfuyuan@user.noreply.gitee.com">ubuntu</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
   <depend>grippers_interfaces</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <!-- lerobot / torch 는 rosdep 에 없다. 컨테이너에 pip 로 넣는다 —
+       tools/vla/README.md 참고. 여기 적으면 rosdep install 이 실패한다. -->
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

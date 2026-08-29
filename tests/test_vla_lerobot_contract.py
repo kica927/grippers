@@ -104,6 +104,62 @@ def test_피처_이름이_lerobot_철자와_같다():
     assert '"names": ["height", "width", "channels"]' in src
 
 
+# ── 체크포인트가 이 팔의 것인지 ────────────────────────────────────────────
+
+
+def test_적재할_때_액션_차원을_확인한다():
+    """틀린 체크포인트를 줘도 추론은 그냥 돈다. 관절 수가 안 맞는 것을
+    움직이고 나서 알면 늦다 — 그 시점엔 이미 팔이 잡혀 있다.
+
+    _get_action_chunk 가 내부 패딩(max_action_dim=32)을 데이터셋 차원으로
+    다시 자르므로(modeling_smolvla.py:295), config.action_feature 가 곧
+    우리가 받는 차원이다."""
+    src = NODE.read_text(encoding="utf-8")
+
+    assert "action_feature" in src
+    assert "JOINT_COUNT" in src
+
+
+def test_적재할_때_카메라_이름을_확인한다():
+    """이름이 다르면 prepare_images 가 '이미지 피처가 전부 없다'로 예외를
+    던지는데, 그건 첫 추론 시점이다."""
+    src = NODE.read_text(encoding="utf-8")
+
+    assert "image_features" in src
+
+
+def test_카메라_이름이_변환기와_같다():
+    """학습 데이터셋에 'gripper' 로 들어갔으면 추론도 그 이름이어야 한다."""
+    node = NODE.read_text(encoding="utf-8")
+    conv = CONVERTER.read_text(encoding="utf-8")
+
+    assert 'IMAGE_KEY = "gripper"' in node
+    assert 'image_keys = ["gripper"]' in conv
+
+
+def test_적재_검사가_예외를_던진다():
+    """경고만 하면 사람이 지나친다."""
+    tree = ast.parse(NODE.read_text(encoding="utf-8"))
+    check = next(n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "_check_policy_shape")
+
+    assert [n for n in ast.walk(check) if isinstance(n, ast.Raise)]
+
+
+def test_적재_검사를_실제로_부른다():
+    """검사 함수가 있어도 안 부르면 아무 일도 안 일어난다. 그리고 안 부르는
+    쪽으로 바꿔도 다른 테스트는 전부 통과한다 — 그래서 호출을 따로 못
+    박는다."""
+    tree = ast.parse(NODE.read_text(encoding="utf-8"))
+    load = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "_load_policy")
+    calls = [n for n in ast.walk(load)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "attr", "") == "_check_policy_shape"]
+
+    assert calls, "_load_policy 가 _check_policy_shape 를 불러야 한다"
+
+
 # ── 확인한 버전을 적어 둔다 ────────────────────────────────────────────────
 
 

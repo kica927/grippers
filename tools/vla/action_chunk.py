@@ -29,10 +29,26 @@ SmolVLA 는 한 번 추론할 때 액션을 **한 개가 아니라 묶음으로*
 움직이는 구간이 생긴다. `max_chunk_age_s` 를 넘기면 추종을 **해제**한다 —
 정지가 아니라 해제다. 팔로워는 토크를 유지한 채 그 자리에 선다(들고 있던
 물건을 떨어뜨리지 않는다).
+
+## 0/4095 이음매를 넘어서 계산한다
+
+학습 데이터는 `episode_spec.unwrap_series` 로 **펴서** 만든다. 이음매를
+넘는 에피소드에서는 그 값이 0..4095 를 벗어나고, 정책은 그 공간에서
+출력한다. 반면 `prime()` 에 들어오는 실측 자세는 서보가 읽어 준 원시
+0..4095 다.
+
+그래서 두 값을 그냥 빼면 안 된다. 같은 물리 자세인데 4100 과 5 로 표현될
+수 있고, 뺄셈은 +4095 를 준다 — 슬루에 걸려 팔이 **반대 방향으로 영원히
+기어간다.** 최단 회전(`wrap_delta`)으로 계산하면 +9 다.
+
+한 틱의 실제 이동은 슬루(80카운트)로 잘리므로 최단 회전이 언제나 진짜
+움직임이다 — 반 바퀴(2048)를 20ms 에 도는 관절은 없다.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from episode_spec import POS_RANGE, wrap_delta
 
 # 팔로워의 --slew 기본값과 같다. 50Hz 에서 80카운트 ≈ 350°/s.
 # 여기 값이 팔로워보다 크면 팔로워가 조용히 자른다 — 같게 두는 것이 요점이다.
@@ -91,7 +107,7 @@ class ChunkPlayer:
 
         이것을 안 하면 첫 틱에서 슬루가 '마지막 값 없음' 상태로 걸려,
         정책의 첫 액션이 통째로 나가 버린다."""
-        self._last = list(counts)
+        self._last = [int(c) % POS_RANGE for c in counts]
 
     @property
     def remaining(self) -> int:
@@ -124,18 +140,20 @@ class ChunkPlayer:
     def _emit(self, want: list) -> Tick:
         """② 슬루를 걸고 보낸다. 잘린 관절 수를 같이 돌려준다."""
         if not self._last:
-            self._last = [int(v) for v in want]
+            self._last = [int(v) % POS_RANGE for v in want]
             return Tick(list(self._last), True)
 
         out = []
         clamped = 0
         for prev, target in zip(self._last, want):
-            step = int(target) - int(prev)
+            # 최단 회전으로 본다 — 위 "0/4095 이음매" 참고. 뺄셈을 쓰면
+            # 이음매를 넘은 에피소드에서 팔이 반대로 기어간다.
+            step = wrap_delta(int(target) % POS_RANGE, int(prev) % POS_RANGE)
             if step > self.slew:
                 step, clamped = self.slew, clamped + 1
             elif step < -self.slew:
                 step, clamped = -self.slew, clamped + 1
-            out.append(int(prev) + step)
+            out.append((int(prev) + step) % POS_RANGE)
         self._last = out
         self.clamped_total += clamped
         return Tick(list(out), True, clamped=clamped)

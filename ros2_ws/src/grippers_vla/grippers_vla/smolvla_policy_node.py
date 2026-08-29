@@ -66,6 +66,10 @@ import action_chunk  # noqa: E402
 import episode_spec  # noqa: E402
 from teleop_protocol import DEFAULT_PORT, encode  # noqa: E402
 
+# 데이터셋의 카메라 이름과 같아야 한다(bag_to_lerobot.py 가 "gripper" 로
+# 넣는다). 다르면 정책이 관측을 못 찾는다.
+IMAGE_KEY = "gripper"
+
 IMAGE_TOPIC_DEFAULT = "gripper_cam/image_raw/compressed"
 STATE_TOPIC_DEFAULT = "teleop/follower_present"
 
@@ -196,8 +200,37 @@ class SmolvlaPolicyNode(Node):
         pre, post = make_pre_post_processors(
             policy.config, pretrained_path=path,
             preprocessor_overrides=override, postprocessor_overrides=override)
+        self._check_policy_shape(policy)
         self.get_logger().info(f"정책·전후처리기 적재 완료: {path} ({device})")
         return policy, pre, post
+
+    def _check_policy_shape(self, policy) -> None:
+        """이 체크포인트가 **이 팔**의 것인지 적재 시점에 본다.
+
+        틀린 체크포인트(다른 로봇, 또는 파인튜닝 안 한 smolvla_base)를 주면
+        추론은 그냥 돌아간다. 액션 차원이 6이 아니면 관절 수가 안 맞고,
+        카메라 이름이 다르면 prepare_images 가 빈 배치로 예외를 던지는데 —
+        **그 시점엔 이미 팔이 잡혀 있다.** 적재할 때 걸러야 한다.
+
+        `_get_action_chunk` 는 내부 패딩(max_action_dim=32)을 데이터셋
+        차원으로 다시 잘라 준다(modeling_smolvla.py:295). 그래서 여기서
+        보는 config.action_feature 가 곧 우리가 받게 될 차원이다."""
+        feature = getattr(policy.config, "action_feature", None)
+        dim = None if feature is None else int(feature.shape[0])
+        if dim != episode_spec.JOINT_COUNT:
+            raise RuntimeError(
+                f"액션 차원이 {dim} 입니다 — 이 팔은 관절 {episode_spec.JOINT_COUNT}개입니다.\n"
+                "  다른 로봇의 체크포인트이거나, 파인튜닝하지 않은 "
+                "smolvla_base 를 그대로 준 것입니다.")
+
+        image_key = f"observation.images.{IMAGE_KEY}"
+        known = set(getattr(policy.config, "image_features", {}) or {})
+        if known and image_key not in known:
+            raise RuntimeError(
+                f"이 체크포인트가 아는 카메라: {sorted(known)}\n"
+                f"  우리가 보내는 것: {image_key}\n"
+                "  학습 데이터셋의 카메라 이름과 같아야 합니다 "
+                "(bag_to_lerobot.py 의 image_keys).")
 
     def _infer_loop(self):
         try:
@@ -224,7 +257,7 @@ class SmolvlaPolicyNode(Node):
             # 받지 않는다.
             batch = prepare_observation_for_inference(
                 {
-                    "observation.images.gripper": np.ascontiguousarray(image),
+                    f"observation.images.{IMAGE_KEY}": np.ascontiguousarray(image),
                     "observation.state": np.asarray(state, dtype=np.float32),
                 },
                 device, task=self._task)

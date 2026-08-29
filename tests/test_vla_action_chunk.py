@@ -117,6 +117,81 @@ def test_기본_슬루가_팔로워와_같다():
     assert f'default={ac.SLEW_COUNTS_DEFAULT}' in text
 
 
+# ── 0/4095 이음매 ──────────────────────────────────────────────────────────
+#
+# 학습 데이터는 unwrap 해서 만들므로 정책 출력이 0..4095 를 벗어날 수 있다.
+# 반면 prime() 에 들어오는 실측 자세는 서보가 읽어 준 원시값이다. 두 공간을
+# 그냥 빼면 같은 자세가 4095 카운트 차이로 보인다.
+
+
+def test_이음매_너머의_목표를_최단_회전으로_본다():
+    """정책이 4100(=4)을 냈고 팔은 5에 있다. 실제 이동은 -1 이지 +4095 가
+    아니다. 뺄셈을 쓰면 슬루에 걸려 팔이 반대 방향으로 기어간다."""
+    p = ac.ChunkPlayer(slew=80)
+    p.prime([5] * 6)
+    p.submit([[4100] * 6], now=0.0)
+
+    tick = p.tick(0.0)
+
+    assert tick.counts == [4] * 6
+    assert tick.clamped == 0, "정상 이동을 잘랐다면 방향 계산이 틀린 것이다"
+
+
+def test_아래로_이음매를_넘어간다():
+    """4090 에서 10 으로 = +16."""
+    p = ac.ChunkPlayer(slew=80)
+    p.prime([4090] * 6)
+    p.submit([[10] * 6], now=0.0)
+
+    assert p.tick(0.0).counts == [10] * 6
+
+
+def test_위로_이음매를_넘어간다():
+    """10 에서 4090 으로 = -16."""
+    p = ac.ChunkPlayer(slew=80)
+    p.prime([10] * 6)
+    p.submit([[4090] * 6], now=0.0)
+
+    assert p.tick(0.0).counts == [4090] * 6
+
+
+def test_보내는_값은_항상_0_4095_안이다():
+    """팔로워도 다시 감지만, 우리 쪽 계측이 범위 밖 숫자를 들고 있으면
+    로그를 읽는 사람이 무엇이 일어났는지 알 수 없다."""
+    p = ac.ChunkPlayer(slew=1000)
+    p.prime([4000] * 6)
+    p.submit([[5000] * 6, [9000] * 6], now=0.0)
+
+    for _ in range(2):
+        assert all(0 <= v < ac.POS_RANGE for v in p.tick(0.0).counts)
+
+
+def test_이음매를_넘어도_슬루는_그대로_걸린다():
+    """최단 회전으로 봐도 여전히 먼 목표는 잘려야 한다."""
+    p = ac.ChunkPlayer(slew=80)
+    p.prime([0] * 6)
+    p.submit([[1000] * 6], now=0.0)
+
+    tick = p.tick(0.0)
+
+    assert tick.counts == [80] * 6
+    assert tick.clamped == 6
+
+
+def test_최단_회전_정의가_텔레옵과_같다():
+    """팔로워도 wrap_delta 로 리더 변화량을 잰다. 식이 다르면 우리가 보낸
+    목표와 팔이 실제로 가는 곳이 갈라진다."""
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent
+                            / "tools" / "teleop"))
+    import teleop_protocol
+
+    assert ac.POS_RANGE == teleop_protocol.POS_RANGE
+    for a, b in [(4100 % 4096, 5), (10, 4090), (0, 0), (2048, 0)]:
+        assert ac.wrap_delta(a, b) == teleop_protocol.wrap_delta(a, b)
+
+
 # ── ③ 정책이 세상을 안 보는 동안 움직이지 않는다 ───────────────────────────
 
 

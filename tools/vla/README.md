@@ -37,6 +37,25 @@ python tools/arm/backup_servo_offsets.py COM8 --restore tools/arm/servo_backup/s
 좌우 끝까지 돌리면 팔로워가 한계에 부딪힙니다** — 시연 중에 그 자세를 쓰지
 마세요.
 
+### 이 브랜치에서는 arm_driver_node 를 기본값으로 못 띄웁니다
+
+`arm_driver_node` 는 기동할 때 서보의 `Homing_Offset` 을
+`floor_grasp_profiles.TAUGHT_HOMING_OFFSETS`(교시 당시 값)와 대조하고,
+다르면 거부합니다. **이 브랜치는 VLA 캘리브레이션으로 도는 것이 정상**이라
+그 검사에 걸립니다.
+
+VLA 수집·추론에는 `arm_driver_node` 가 필요 없습니다 — 팔은
+`follower_teleop_node` 가 잡습니다(둘은 같은 시리얼 포트를 못 나눠 쓰므로
+어차피 동시에 못 뜹니다). bringup 은 `use_fake_arm:=true` 로 띄우세요.
+
+굳이 띄워야 한다면 `-p verify_calibration:=false` 를 주되, **그 팔로는
+베이스라인 교시 자세를 쓰지 마세요.** 지금 어느 캘리브레이션인지는 언제든
+이렇게 봅니다.
+
+```
+python3 tools/arm/restore_taught_offsets.py
+```
+
 ---
 
 ## 작업 규칙

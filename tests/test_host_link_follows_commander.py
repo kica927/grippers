@@ -14,6 +14,7 @@
 그 규칙과, 그 규칙이 **아무 패킷에나 끌려가지 않는다**는 것을 같이 지킨다.
 """
 import json
+import pytest
 import socket
 import sys
 import time
@@ -86,7 +87,15 @@ def test_unparseable_packets_do_not_redirect_reports():
     pi = UdpHostLink(WRONG, command_port=cmd_port, status_port=status_port)
     before = pi._host
     junk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    junk.bind(("127.0.0.3", 0))
+    try:
+        # 리눅스는 127.0.0.0/8 전체가 로컬이라 아무 주소나 바인드된다.
+        # macOS 는 lo0 에 127.0.0.1 하나만 있어서 alias 를 만들지 않으면
+        # 실패한다 — 확인하려는 것(엉뚱한 주소로 끌려가지 않는가)은 같으므로
+        # 그 환경에서는 건너뛴다. 파이/CI(리눅스)에서는 그대로 돈다.
+        junk.bind(("127.0.0.3", 0))
+    except OSError:
+        junk.close()
+        pytest.skip("127.0.0.3 을 바인드할 수 없는 환경 (macOS 기본)")
     junk.sendto(b"not json at all", (OURS, cmd_port))
     time.sleep(0.3)
     assert pi._host == before, f"쓰레기 패킷에 {pi._host} 로 끌려갔다"

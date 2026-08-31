@@ -54,7 +54,9 @@ from .floor_grasp_profiles import (
     HORIZONTAL_GRASP_POSES_DEG,
     HORIZONTAL_SAFE_145_RAW,
     IDLE_CRADLE_RAW,
+    TAUGHT_HOMING_OFFSETS,
 )
+from . import calib_identity
 
 WRIST_SERVO_ID = 4
 GRIPPER_SERVO_ID = 6
@@ -148,6 +150,32 @@ JOINT_READ_ATTEMPTS = 3
 JOINT_READ_RETRY_SEC = 0.05
 MAX_FLOOR_POSE_SERVO2_TEMP_C = 50
 FLOOR_POSE_START_TOLERANCE_RAW = 120
+# ⚠️ 위 120 raw(약 10.5도)는 **교시 자세 단계 사이**를 오갈 때 쓰라고 정한
+# 값이다(_wait_floor_pose_arrived 주석 참고: 다음 단계의 시작 자세 게이트와
+# 같은 값을 써야 한다). GRASP 좌우 정렬 보정처럼 몇 도짜리 미세 이동에
+# 그대로 쓰면 이동 자체가 "이미 도착"으로 걸러진다.
+#
+# 2026-08-28 실기에서 정확히 그 일이 났다. 뎁스캠이 룩을 좌우 +27mm로 보고
+# servo 1을 +5.2도(59 raw) 돌리라고 했는데, 59 < 120이라 _glide_phase가
+# 관절을 통째로 버렸다. 로그에는 `offset_base_yaw: servo 1 2067 -> 2067
+# (+5.2도)`가 찍히고 서비스는 ok=True를 냈다 — 움직이지 않았는데 성공이다.
+# Pi는 매 사이클 같은 +27mm를 다시 보고 같은 보정을 다시 걸어, 60초 내내
+# GRASP_CENTERING만 반복하고 하강으로 넘어가지 못했다.
+#
+# 좌우 정렬 허용오차는 GRASP_CENTERING_TOLERANCE_M = 10mm이고, servo 1 축에서
+# 턱까지가 294mm(baseline_constants.SERVO1_AXIS_TO_JAW_MM, 실측 2026-08-26)
+# 이므로 10mm는 약 1.95도 = 22 raw다. 즉 이 보정은 22 raw 단위를 분간해야
+# 하는 동작이라 120 raw 격자로는 원리적으로 불가능하다.
+#
+# ⚠️ 이 주석은 2026-08-29까지 214mm(= 30 raw)로 적혀 있었다. 실측 전의
+# 어림값이 남아 있던 것이고, 결론(120으로는 불가능)은 어느 값으로도 같지만
+# 숫자를 인용하면 틀린 값이 퍼진다. 팔 길이의 단일 출처는 baseline_constants다.
+BASE_YAW_TOLERANCE_RAW = 10  # 약 0.9도 = 294mm 거리에서 약 4.5mm
+# 좌우 보정 글라이드의 waypoint 간격(raw). 교시 자세 이동은 FLOOR_POSE_STEPS
+# (30)로 고정이지만, 이 보정은 5도짜리도 있고 15도짜리도 있어서 고정 단계
+# 수를 쓰면 짧은 이동에 같은 3.0초를 쓴다. 12 raw(약 1도)마다 한 점씩 찍으면
+# 5.2도 보정이 5단계 = 0.5초로 끝나 호출자의 3.0초 대기 안에 들어온다.
+BASE_YAW_RAW_PER_STEP = 12
 # recover_idle이 "지금 어느 등록 자세에서 시작하는가"를 판정하는 허용치.
 # 정상 경로의 게이트(120)보다 넉넉하다 — 복구가 필요한 상황은 정의상 팔이
 # 목표에 못 미친 상황이라 120으로는 아무 자세에도 안 붙는다. 대신 이 값을
@@ -205,6 +233,14 @@ class ArmPortConflictError(RuntimeError):
     main()이 잡아서 노드를 띄우지 않고 종료한다."""
 
 
+class ArmCalibrationMismatchError(RuntimeError):
+    """팔에 실린 캘리브레이션이 교시 자세와 다르다.
+
+    하드웨어 고장이 아니다 — 팔은 멀쩡하고, 다만 이 코드가 아는 자세가
+    아니다. 그래서 ArmHardwareUnavailableError 와 따로 둔다: 사람이 할 일이
+    '고치기'가 아니라 '오프셋 되돌리기 또는 다시 교시하기'다."""
+
+
 class ArmHardwareUnavailableError(RuntimeError):
     """SO-ARM101 또는 서보 버스가 응답하지 않거나 동작 불가 상태일 때 발생한다."""
 
@@ -217,6 +253,9 @@ class ArmDriverNode(Node):
         self.declare_parameter("arm_port", "/dev/soarm")
         self.declare_parameter("enable_torque_on_start", False)
         self.declare_parameter("auto_align_on_first_move", True)
+        # 교시 자세와 다른 캘리브레이션에서 기동을 거부한다. 끄는 것은
+        # 팔을 다시 교시하는 중처럼 자세가 무효인 줄 알고 있을 때만이다.
+        self.declare_parameter("verify_calibration", True)
         # 그리퍼 명령 폭의 하한. 기본값은 파지 전용 하한이고, 지금은 그것이
         # GRIPPER_CLOSED_MM과 같아 동작이 바뀌지 않는다
         # (gripper_calibration.GRIPPER_GRASP_MIN_MM 주석 참고).
@@ -246,6 +285,7 @@ class ArmDriverNode(Node):
             soarm._real,
             enable_torque_on_start=enable_torque_on_start,
         )
+        self._check_taught_calibration(soarm._real)
         self._log_idle_offset(soarm._real)
 
         self._move_action_server = ActionServer(
@@ -347,6 +387,40 @@ class ArmDriverNode(Node):
                 "ps -eo pid,args | grep arm_driver | grep -v grep"
             ) from e
         self.get_logger().info(f"{arm_port} 배타 잠금 확보")
+
+    def _check_taught_calibration(self, backend) -> None:
+        """이 팔의 Homing_Offset 이 교시 당시와 같은지 본다.
+
+        ⚠️ 2026-08-29 에 VLA 시연 수집을 준비하며 LeRobot 캘리브레이션을
+        돌렸고, 그때 서보의 Homing_Offset 이 덮여 썼다. 오프셋이 바뀌면
+        floor_grasp_profiles.py 의 RAW 자세가 **같은 숫자로 다른 물리
+        자세**를 가리킨다.
+
+        오프셋은 서보 EEPROM 에 있지 git 에 있지 않아서, 브랜치를 바꿔도
+        팔은 안 바뀐다. 코드는 베이스라인인데 팔은 VLA 캘리브레이션인
+        조합이 아무 경고 없이 만들어진다 — 그 상태로 움직이면 차체·라이다에
+        막히는 범위로 들어간다(shoulder_pan 가동폭 2493 -> 2087, sysy009
+        실측 2026-08-29).
+
+        그래서 경고가 아니라 거부다."""
+        if not bool(self.get_parameter("verify_calibration").value):
+            self.get_logger().warn(
+                "verify_calibration=false — 교시 자세가 유효한지 확인하지 않습니다")
+            return
+
+        # 단발 읽기로는 안 된다. 이 버스는 패킷을 이따금 흘리고, 서보 6개
+        # 연속 읽기라 묶음이 깨질 확률이 그만큼 쌓인다(_read_with_retry 주석
+        # 참고). 재시도가 없으면 패킷 하나 유실이 그대로 기동 거부가 되는데,
+        # 그건 이 검사가 막으려는 위험과 아무 상관이 없는 실패다.
+        current = {
+            servo_id: self._read_with_retry(backend.drv.get_homing_offset, servo_id)
+            for servo_id in sorted(TAUGHT_HOMING_OFFSETS)
+        }
+        result = calib_identity.verdict(current, TAUGHT_HOMING_OFFSETS)
+        if result.ok:
+            self.get_logger().info(f"캘리브레이션 확인 — {result.message()}")
+            return
+        raise ArmCalibrationMismatchError(result.message())
 
     def _check_startup_torque(
         self,
@@ -610,8 +684,21 @@ class ArmDriverNode(Node):
         }
         self._glide_to_raw_positions(backend, goal)
 
+    @staticmethod
+    def _tolerance_for(tolerance_raw, servo_id: int) -> int:
+        """관절 하나의 허용오차. 정수면 전 관절 공통, dict면 관절별이다.
+
+        dict에 없는 관절은 기본값을 쓴다 — 미세 이동이 필요한 관절만
+        따로 조이고 나머지는 원래 게이트를 그대로 두려는 것이다. 전
+        관절을 같이 조이면, 실제로 움직이지 않는 관절(중력을 받는 어깨
+        같은)의 몇 raw짜리 처짐까지 실패로 잡는다."""
+        if isinstance(tolerance_raw, dict):
+            return tolerance_raw.get(servo_id, FLOOR_POSE_START_TOLERANCE_RAW)
+        return tolerance_raw
+
     def _glide_to_raw_positions(
-        self, backend, goal, defer_joints=(), speed_raw=FLOOR_POSE_SPEED_RAW
+        self, backend, goal, defer_joints=(), speed_raw=FLOOR_POSE_SPEED_RAW,
+        tolerance_raw=FLOOR_POSE_START_TOLERANCE_RAW, steps=FLOOR_POSE_STEPS
     ) -> None:
         """servo 1..5 raw 목표로 이동한다.
 
@@ -625,7 +712,8 @@ class ArmDriverNode(Node):
         관절 순서가 반대이기 때문이다 — 그래서 호출부가 정한다."""
         deferred = tuple(servo_id for servo_id in defer_joints if servo_id in goal)
         if not deferred:
-            self._glide_phase(backend, goal, speed_raw=speed_raw)
+            self._glide_phase(backend, goal, speed_raw=speed_raw,
+                              tolerance_raw=tolerance_raw, steps=steps)
             return
 
         start = self._read_joint_positions(backend)
@@ -634,14 +722,22 @@ class ArmDriverNode(Node):
 
         # 1구간: 지연 관절은 출발 위치에 **고정**하고 나머지만 목표로.
         hold_deferred = {**goal, **{servo_id: start[servo_id] for servo_id in deferred}}
-        self._glide_phase(backend, hold_deferred, label="1/2 지연관절 고정", speed_raw=speed_raw)
+        self._glide_phase(backend, hold_deferred, label="1/2 지연관절 고정", speed_raw=speed_raw,
+                          tolerance_raw=tolerance_raw, steps=steps)
         # 2구간: 나머지는 이미 목표에 있으므로 지연 관절만 실제로 움직인다.
         self._glide_phase(
-            backend, goal, label=f"2/2 servo {list(deferred)} 단독", speed_raw=speed_raw
+            backend, goal, label=f"2/2 servo {list(deferred)} 단독", speed_raw=speed_raw,
+            tolerance_raw=tolerance_raw, steps=steps
         )
 
-    def _glide_phase(self, backend, goal, label=None, speed_raw=FLOOR_POSE_SPEED_RAW) -> None:
-        """한 번의 선형 보간 구간 — 목표에 이미 있으면 아무것도 하지 않는다."""
+    def _glide_phase(self, backend, goal, label=None, speed_raw=FLOOR_POSE_SPEED_RAW,
+                     tolerance_raw=FLOOR_POSE_START_TOLERANCE_RAW,
+                     steps=FLOOR_POSE_STEPS) -> None:
+        """한 번의 선형 보간 구간 — 목표에 이미 있으면 아무것도 하지 않는다.
+
+        "이미 있다"의 기준은 `tolerance_raw`다. 미세 이동을 시키려면 이
+        값을 같이 줄여야 한다 — 안 그러면 이동이 조용히 버려진다
+        (BASE_YAW_TOLERANCE_RAW 주석의 2026-08-28 사례)."""
         start = self._read_joint_positions(backend)
         if start is None:
             raise ArmHardwareUnavailableError("시작 관절 위치 읽기 실패")
@@ -649,7 +745,8 @@ class ArmDriverNode(Node):
         moving = {
             servo_id: goal[servo_id] - start[servo_id]
             for servo_id in range(1, 6)
-            if abs(goal[servo_id] - start[servo_id]) > FLOOR_POSE_START_TOLERANCE_RAW
+            if abs(goal[servo_id] - start[servo_id])
+            > self._tolerance_for(tolerance_raw, servo_id)
         }
         if not moving:
             return  # 이미 도착해 있다 — 빈 구간에 시간을 쓰지 않는다
@@ -672,19 +769,20 @@ class ArmDriverNode(Node):
             backend.drv.set_speed(servo_id, speed_raw)
             backend.drv.set_acceleration(servo_id, FLOOR_POSE_ACCEL_RAW)
 
-        for step_index in range(1, FLOOR_POSE_STEPS + 1):
-            ratio = step_index / FLOOR_POSE_STEPS
+        for step_index in range(1, steps + 1):
+            ratio = step_index / steps
             for servo_id in range(1, 6):
                 position = round(start[servo_id] + ratio * (goal[servo_id] - start[servo_id]))
                 if not backend.drv.set_position(servo_id, position):
                     raise ArmHardwareUnavailableError(
-                        f"servo {servo_id} write 실패 — step {step_index}/{FLOOR_POSE_STEPS}"
+                        f"servo {servo_id} write 실패 — step {step_index}/{steps}"
                     )
             time.sleep(FLOOR_POSE_STEP_SEC)
 
-        self._wait_floor_pose_arrived(backend, goal)
+        self._wait_floor_pose_arrived(backend, goal, tolerance_raw=tolerance_raw)
 
-    def _wait_floor_pose_arrived(self, backend, goal) -> None:
+    def _wait_floor_pose_arrived(self, backend, goal,
+                                 tolerance_raw=FLOOR_POSE_START_TOLERANCE_RAW) -> None:
         """보간이 끝난 뒤 servo 1..5가 실제로 goal에 도달할 때까지 기다린다.
 
         ⚠️ 2026-08-24 실기에서 확인한 문제: 예전에는 여기서 그냥
@@ -736,7 +834,8 @@ class ArmDriverNode(Node):
             residual = {
                 servo_id: actual[servo_id] - goal[servo_id] for servo_id in range(1, 6)
             }
-            if all(abs(error) <= FLOOR_POSE_START_TOLERANCE_RAW for error in residual.values()):
+            if all(abs(error) <= self._tolerance_for(tolerance_raw, servo_id)
+                   for servo_id, error in residual.items()):
                 return
 
             now = time.monotonic()
@@ -755,7 +854,7 @@ class ArmDriverNode(Node):
         raise ArmHardwareUnavailableError(
             f"{waited:.1f}s 기다렸으나 목표 자세에 도달하지 못했습니다({reason}) — "
             f"잔차(raw) {residual}, 최악 servo {worst} {residual[worst]:+d} "
-            f"(허용 ±{FLOOR_POSE_START_TOLERANCE_RAW})"
+            f"(허용 ±{self._tolerance_for(tolerance_raw, worst)})"
         )
 
     @staticmethod
@@ -1284,14 +1383,29 @@ class ArmDriverNode(Node):
         return response
 
     def _on_fold_to_cradle(self, request, response):
+        """팔을 교시 IDLE(IDLE_CRADLE_RAW)로 접는다. 도달을 확인하고 답한다.
+
+        ⚠️ 예전 구현은 IDLE 로 가지 않았다. CRADLE_XYZ_M([0.15, 0, 0.20])
+        으로 역기구학 이동을 한 뒤 1.2초 자고 **무조건** success=True 를
+        냈다. 그 좌표에는 "INSERT 후 복귀 경로 별도 실측 필요"라는 TODO 가
+        달려 있었다 — 교시된 자세가 아니라 자리표시자다.
+
+        2026-08-28 실기에서 그 대가를 치렀다. 이 서비스가 성공을 반환한
+        직후 팔은 IDLE 에서 s3=-856 s5=-935 raw(각각 약 75도, 82도)
+        떨어진 자세에 서 있었다. 성공을 믿고 다음 동작을 시키면 자세
+        게이트에서 거부되거나, 더 나쁘게는 그 자세에서 바닥으로 내려간다.
+
+        이제 `_auto_align_to_idle()` 에 위임한다. 그 함수는 어디서
+        시작하든 안전한 경로를 고르고(바닥 높이면 safe 를 경유해 들어
+        올린다), 열린 그리퍼를 접기 전에 닫고, **도달할 때까지 기다렸다가**
+        잔차를 로그로 남긴다. 도달 못 하면 예외가 나므로 success=False 가
+        정직하게 나간다."""
         try:
             self._require_operational_servos(range(1, 6))
-
-            soarm.go(CRADLE_XYZ_M, grip=None, real=True, down=False, secs=1.2)
-            time.sleep(1.2)
-
+            self._auto_align_to_idle()
             self._require_operational_servos(range(1, 6))
             response.success = True
+            response.message = "IDLE 복귀 완료"
         except Exception as e:
             self.get_logger().error(f"fold_to_cradle 실패: {e}")
             response.success = False
@@ -1300,7 +1414,15 @@ class ArmDriverNode(Node):
 
     # servo 1 좌우 보정의 한계각. 이보다 크게 돌려야 할 만큼 어긋났다면
     # 그건 차량이 잘못 선 것이라 Host가 다시 세워야 한다(사용자 지시
-    # 2026-08-26의 "영역 밖" 갈래). 팔 길이 240mm 기준 15도면 약 64mm다.
+    # 2026-08-26의 "영역 밖" 갈래).
+    #
+    # 팔 길이 294mm(실측 2026-08-26) 기준 15도면 약 79mm다. 이 값이 체스말
+    # 턱 폭 허용치(±76mm)와 거의 같은 것이 우연이 아니라 중요하다 — 턱 폭
+    # 안에 들어온 물체는 servo 1으로 전부 중앙에 맞출 수 있고, 한계각에
+    # 걸리는 경우와 영역 밖인 경우가 사실상 같은 지점에서 갈린다
+    # (baseline_constants.SERVO1_AXIS_TO_JAW_MM 주석).
+    #
+    # ⚠️ 2026-08-29까지 여기 240mm(= 64mm)로 적혀 있었다. 실측 전 어림값이다.
     MAX_BASE_YAW_OFFSET_RAD = math.radians(15.0)
 
     # STS3215는 한 바퀴가 4096 카운트다.
@@ -1343,17 +1465,76 @@ class ArmDriverNode(Node):
                     f"servo 1 목표 {target}가 관절 범위(0~{POSITION_RAW_MAX}) 밖입니다")
                 return response
 
+            # ⚠️ 한계각은 **교시 정면(IDLE)으로부터의 절대 각도**로 본다.
+            # 예전에는 한 번의 요청 크기만 봤는데, 이 서비스는 현재 위치를
+            # 기준으로 상대 회전을 하므로 같은 요청이 반복되면 servo 1이
+            # 한 번에 15도를 넘지 않으면서도 얼마든지 멀리 걸어간다.
+            #
+            # 반복은 정상 동작이다 — 이 보정은 "관측 -> 소이동 -> 재관측"
+            # 폐루프라 여러 사이클에 걸쳐 수렴한다(_judge_alignment 주석).
+            # 2026-08-28 실기에서 좌우 오차는 3회 보정(합 약 14도) 만에
+            # 56.9mm -> 26.7mm 로 줄어 READY 가 났다. 즉 루프는 닫힌다.
+            #
+            # 문제는 수렴하지 못하는 경우다. 물체가 애초에 팔이 닿는 범위
+            # 밖이면 같은 방향 보정이 계속 나오는데, 상대 회전이라 한 번에
+            # 15도를 안 넘으면서 얼마든지 멀리 걸어갈 수 있다. 위 실측이
+            # 이미 14도까지 갔으니 여유가 크지 않다.
+            #
+            # 한계에 걸리면 ok=False 가 나가고 Pi 는 "servo 1이 거부했다,
+            # 재회전 필요"로 Host 에 차량 재정렬을 요청한다 — 팔로 못 고칠
+            # 만큼 틀어졌으면 차를 다시 세우는 것이 맞고, 이미 있는 경로다.
+            drift_raw = target - IDLE_CRADLE_RAW[0]
+            limit_raw = self.MAX_BASE_YAW_OFFSET_RAD * self.RAW_PER_RADIAN
+            if abs(drift_raw) > limit_raw:
+                response.message = (
+                    f"servo 1이 교시 정면에서 "
+                    f"{math.degrees(drift_raw / self.RAW_PER_RADIAN):+.1f}도까지 "
+                    f"벌어집니다 — 한계 ±{math.degrees(self.MAX_BASE_YAW_OFFSET_RAD):.0f}도. "
+                    "차량을 다시 세워야 합니다")
+                self.get_logger().warn(f"offset_base_yaw: {response.message}")
+                return response
+
             goal = {servo_id: actual[servo_id] for servo_id in range(1, 6)}
             goal[1] = target
-            self._glide_to_raw_positions(backend, goal)
+            # servo 1만 미세 허용오차로 옮긴다. 기본 120 raw를 그대로 쓰면
+            # 몇 도짜리 정렬 보정이 통째로 버려진다(BASE_YAW_TOLERANCE_RAW
+            # 주석의 2026-08-28 사례). 나머지 관절은 제자리를 지키기만
+            # 하면 되므로 원래 게이트를 그대로 둔다.
+            # 단계 수를 이동 거리에 맞춘다. 교시 자세용 기본값
+            # FLOOR_POSE_STEPS(30)를 그대로 쓰면 5도짜리 보정에도 3.0초
+            # (30 x FLOOR_POSE_STEP_SEC)를 쓴다. 그러면 호출자의 서비스
+            # 대기(_ros_call.SERVICE_TIMEOUT_SEC = 3.0s)를 넘겨, 팔은 제대로
+            # 돌았는데 Pi 는 실패로 받는다 — 2026-08-28 실기에서 실제로
+            # 세 번 다 그렇게 나왔다.
+            move_raw = abs(target - actual[1])
+            steps = max(3, min(FLOOR_POSE_STEPS,
+                               int(math.ceil(move_raw / BASE_YAW_RAW_PER_STEP))))
+            self._glide_to_raw_positions(
+                backend, goal, tolerance_raw={1: BASE_YAW_TOLERANCE_RAW}, steps=steps)
 
+            # 도달을 **확인하고** ok를 정한다. 예전에는 무조건 True였다 —
+            # 그래서 위 버그로 팔이 한 raw도 안 움직였는데도 성공이 나갔고,
+            # Pi는 보정이 먹은 줄 알고 같은 관측·같은 보정을 무한히 반복했다.
+            # 못 돌렸으면 거부해야 Host가 차량을 다시 세우는 대안 경로
+            # (_judge_alignment 의 "servo 1이 거부했다, 재회전 필요")로 넘어간다.
             settled = self._read_joint_positions(backend)
-            response.position_raw = int(settled[1]) if settled else target
-            response.ok = True
+            if settled is None:
+                response.message = "보정 후 관절 위치 읽기 실패 — 돌았는지 확인 불가"
+                self.get_logger().error(f"offset_base_yaw: {response.message}")
+                return response
+            response.position_raw = int(settled[1])
+            error = response.position_raw - target
+            response.ok = abs(error) <= BASE_YAW_TOLERANCE_RAW
             response.message = (
                 f"servo 1 {actual[1]} -> {response.position_raw} "
-                f"({math.degrees(offset):+.1f}도)")
-            self.get_logger().info(f"offset_base_yaw: {response.message}")
+                f"(목표 {target}, 잔차 {error:+d} raw, {math.degrees(offset):+.1f}도)")
+            if response.ok:
+                self.get_logger().info(f"offset_base_yaw: {response.message}")
+            else:
+                self.get_logger().warn(
+                    f"offset_base_yaw: 도달 실패 — {response.message} "
+                    f"(허용 ±{BASE_YAW_TOLERANCE_RAW} raw)")
+            return response
         except Exception as exc:  # noqa: BLE001 -- 서비스 경계
             response.message = f"servo 1 보정 실패: {exc}"
             self.get_logger().error(response.message)

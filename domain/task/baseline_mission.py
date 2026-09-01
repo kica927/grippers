@@ -252,6 +252,8 @@ class BaselineApproachState(State):
 
         if command.state == MissionState.GRASP:
             return self._judge_grasp(ports, command)
+        if command.state == MissionState.GRASP_FORCE:
+            return self._judge_grasp(ports, command, force=True)
 
         if not _drive(ports, command, self.name):
             return self
@@ -261,11 +263,15 @@ class BaselineApproachState(State):
             return BaselineDoneState()
         return self
 
-    def _judge_grasp(self, ports, command):
+    def _judge_grasp(self, ports, command, force: bool = False):
         """임무 2번 — 조건 판정 후 보고. 충족이면 GRASP로, 아니면 제자리.
 
-        판정은 두 겹이다. 먼저 기본 전제(E-STOP·정지·빈 그리퍼·식별)를 보고,
-        통과하면 **물체가 턱이 쓸고 갈 영역 안에 있는지**를 본다.
+        판정은 두 겹이다. 먼저 기본 전제(정지·식별, 2026-09-01 사용자 지시로
+        E-STOP·빈 그리퍼·교시 자세 확인을 뺐다 — preconditions.check_grasp
+        문서 참고)를 보고, 통과하면 **물체가 턱이 쓸고 갈 영역 안에 있는지**를
+        본다. `force`
+        는 이 중 두 번째 겹(정렬 창)만 건너뛴다 — 첫 겹(기본 전제)은
+        force 여도 그대로 지킨다(2026-08-31, MissionState.GRASP_FORCE 참고).
 
         ⚠️ 이 한 번의 판정에 약 1.7초가 든다(2026-08-26 실측). identify_target이
         오검출을 거르려고 5프레임 합의를 쓰고 CPU 추론이 프레임당 0.3초쯤
@@ -280,54 +286,50 @@ class BaselineApproachState(State):
         observation = ports.perception.identify_target()
         label = observation.label if observation is not None else None
         inputs = pc.GraspInputs(
-            estop_set=ports.estop.is_set(),
             base_stopped=_base_stopped(ports, command),
-            gripper_load=ports.arm.get_load(),
             detected_label=label,
-            profile_known=plan_for_label(label) is not None,
         )
         report = pc.check_grasp(inputs)
         if not report.ok:
             # 보정을 같이 실어 보낸다. 안 보내면 Host가 이 실패를 고칠 수
             # 없는 것으로 읽고 기물을 포기한다 — 2026-08-28 run6이 그랬다.
+            # force 는 이 전제를 건너뛰지 않는다 — 아직 안 멈춘 상태에서는
+            # 강제로도 안 내려간다.
             ports.host.report(Report.GRASP_BLOCKED, self.name, report.detail,
                               corrections.from_grasp_precondition(inputs))
             return self
 
-        return self._judge_alignment(ports, observation, label)
+        return self._judge_alignment(ports, observation, label, force=force)
 
-    def _judge_alignment(self, ports, observation, label):
+    def _judge_alignment(self, ports, observation, label, force: bool = False):
         """좌우·전후 정렬 판정 (사용자 지시 2026-08-26).
 
-        영역 안이면 내려가고, 영역 안인데 치우쳤으면 **Pi가 servo 1로 고친
-        뒤 다시 본다**, 영역 밖이면 Host에 다시 세워 달라고 한다.
+        영역 안이면 내려가고, 영역 밖이면 Host에 다시 세워 달라고 한다.
 
-        보정 직후에 곧장 내려가지 않고 한 사이클 더 관측하는 이유: 이
-        저장소의 접근 제어가 전부 "관측 -> 소이동 -> 재관측" 폐루프다.
-        한 번 계산한 값으로 열린 루프를 돌면 오차가 쌓인다는 것이 이미
-        실기로 확인됐다."""
+        ⚠️ 2026-09-01까지는 영역 안인데 가운데가 아니면 Pi가 servo 1로
+        미세 보정한 뒤 다시 봤다(PI_CENTER). 사용자 지시로 그 경로를
+        없앴다 — 실기에서 servo 1이 첫 보정 때 반대 방향으로 도는 사례가
+        나왔고, 그 보정각이 offset_base_yaw 의 ±15도(교시 정면 기준) 예산을
+        갉아먹어 다음 보정이 "servo 1이 거부했다"로 막히는 일이 반복됐다
+        (2026-08-28 run1/run6도 같은 계열 — test_grasp_centering_loop.py
+        참고). 이제는 턱 폭 안이면 그대로 READY다 — grasp_alignment 모듈
+        docstring의 설계 원칙(평행 턱의 자기정렬 효과)에 맡긴다.
+
+        `force=True` 면 HOST_CORRECTION(영역 밖) 이라도 READY 처럼 내려간다
+        — **UNKNOWN(뎁스캠이 아예 못 잰 경우)은 건너뛰지 않는다.** Host 가
+        재정렬을 충분히 반복했다는 건 매번 유효한 관측이 있었다는 뜻이라
+        HOST_CORRECTION 만 대상이다. 어디 있는지조차 모르는 상태를 강제로
+        내려보내는 것과는 다르다."""
         verdict = ga.judge(observation, object_width_mm(label))
 
-        if verdict.action == ga.READY:
+        if verdict.action == ga.READY or (force and verdict.action == ga.HOST_CORRECTION):
             creep_m = ga.creep_distance_m(observation)
-            ports.host.report(
-                Report.GRASP_READY, self.name,
-                f"{label} {verdict.reason} · 전진 {creep_m * 1000:.0f}mm")
+            reason = (verdict.reason if verdict.action == ga.READY
+                      else f"Host 지시로 강제 진행 — {verdict.reason}")
+            detail = (f"{label} {reason} · 전진 {creep_m * 1000:.0f}mm"
+                      if creep_m is not None else f"{label} {reason}")
+            ports.host.report(Report.GRASP_READY, self.name, detail)
             return BaselineGraspState(label, creep_m, self.retries)
-
-        if verdict.action == ga.PI_CENTER:
-            if ports.arm.offset_base_yaw(verdict.servo1_offset_rad):
-                ports.host.report(Report.GRASP_CENTERING, self.name, verdict.reason,
-                                  corrections.from_alignment(verdict))
-            else:
-                # 관절이 거부했다 — 한계각 초과나 범위 밖이다. 팔로 못 고치면
-                # 차량이 다시 서야 한다.
-                ports.host.report(
-                    Report.GRASP_BLOCKED, self.name,
-                    f"{verdict.reason} — servo 1이 거부했다, 재회전 필요",
-                    corrections.Correction(corrections.ROTATE,
-                                           lateral_m=verdict.lateral_error_m))
-            return self
 
         ports.host.report(Report.GRASP_BLOCKED, self.name, verdict.reason,
                           corrections.from_alignment(verdict))
@@ -407,28 +409,27 @@ class BaselineGraspState(State):
         if not ports.arm.move_to_floor_pose(gp.profile, "carry"):
             return self._failed(ports, "CARRY 전환 실패")
 
-        # 성공 판정은 **독립적인 두 신호가 모두** 있어야 한다(사용자 지시
-        # 2026-08-26). 부하는 "무언가를 쥐고 있다"를, 뎁스 카메라는 "있던
-        # 물체가 그 자리에서 사라졌다"를 말한다 — 실패 양상이 겹치지 않는다.
+        # 2026-08-26 ~ 2026-09-01까지는 성공 판정에 **독립적인 두 신호가
+        # 모두** 있어야 했다(AND). 부하는 "무언가를 쥐고 있다"를, 뎁스
+        # 카메라는 "있던 물체가 그 자리에서 사라졌다"를 말한다는 전제였다.
         #
-        # 부하만 보면 물체 모서리를 살짝 물었거나 턱이 서로를 문 경우도
-        # 통과한다. 뎁스만 보면 내려오는 그리퍼가 물체를 **쳐서 시야 밖으로
-        # 밀어낸** 경우도 "사라짐"으로 읽힌다. 둘 다 요구하면 각자의 오검출이
-        # 서로를 막는다.
+        # ⚠️ 2026-09-01 실기: CARRY 자세에서는 팔·기물이 카메라 프레임
+        # 밖에 있는 게 맞다(floor_grasp_profiles.CARRY_RAW 로 확인된 설계
+        # 그대로) — 그런데도 confirm_grasp() 가 "그대로 있다"를 반환했다.
+        # 즉 눈앞에 없는 rook 을 있다고 오검출한 것이다(뎁스 카메라 쪽의
+        # 오탐). 그 사이 부하(0.0547)는 LOAD_THRESHOLD 를 정상적으로
+        # 넘겼고, 사용자가 직접 파지 성공을 눈으로 확인했다. 뎁스 오탐
+        # 하나가 정상적인 부하 신호를 막는 것을 사용자 지시로 없앤다 —
+        # AND 를 **OR** 로 바꾼다. 부하가 낮고 뎁스도 "그대로 있다"고
+        # 하는, **둘 다 실패를 가리키는 경우만** 진짜 실패로 본다.
         carried = ports.arm.get_load()
         vanished = ports.perception.confirm_grasp()
         if carried < bc.LOAD_THRESHOLD and not vanished:
             return self._failed(ports, f"부하도 낮고 물체도 그대로다 (부하 {carried:.4f})")
-        if carried < bc.LOAD_THRESHOLD:
-            return self._failed(ports, f"CARRY에서 빈손 (부하 {carried:.4f})")
-        if not vanished:
-            # 쥐고는 있는데 목표는 제자리다 — 엉뚱한 것을 물었거나 물체를
-            # 쳐 놓고 턱끼리 문 경우다.
-            return self._failed(
-                ports, f"부하는 {carried:.4f}인데 목표가 그 자리에 남아 있다")
 
-        ports.host.report(Report.GRASP_DONE, MissionState.CARRY,
-                          f"{self.label} 부하 {carried:.4f} · 목표 사라짐 확인")
+        detail = f"{self.label} 부하 {carried:.4f}"
+        detail += " · 목표 사라짐 확인" if vanished else " · 부하로 확인(뎁스 오탐 무시)"
+        ports.host.report(Report.GRASP_DONE, MissionState.CARRY, detail)
         return BaselineCarryState(self.label)
 
     def _failed(self, ports, detail):

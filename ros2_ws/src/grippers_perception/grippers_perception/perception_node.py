@@ -14,8 +14,12 @@ scan_floor는 Hailo-10H YOLO로 실제 검출을 반환할 수 있지만 `scan_f
   DONE으로 유도한다.
 - find_box: 모르면 found=False로 응답한다 — TRANSPORT가 이걸 받으면 대상을
   보류 등록하고 SCAN으로 복귀한다.
-- confirm_grasp: 카메라를 못 열거나 기준 프레임이 없으면 confirmed=False다 —
-  다른 관측 포트와 같은 "모르면 실패" 관례(domain/ports/perception.py 참고).
+
+confirm_grasp는 이 파일에 없다 — domain/adapters/real/ros2_perception.py의
+Ros2Perception.confirm_grasp()가 여기 observe_target 서비스를 재사용해 판정한다
+(remember_target으로 잡은 기준 대비 대상이 사라졌는지/작아졌는지). 한때 여기
+그리퍼캠(/dev/gripper_cam) 기반 별도 구현이 있었으나 2026-08-26 그 방식으로
+대체된 뒤 안 지워진 죽은 코드였다 — 2026-09-01 제거(사용자 지시).
 """
 
 import math
@@ -26,7 +30,6 @@ import rclpy
 from geometry_msgs.msg import Point, Vector3
 from grippers_interfaces.msg import Detection, DetectionArray
 from grippers_interfaces.srv import (
-    ConfirmGrasp,
     MonitorClearance,
     ObserveTarget,
 )
@@ -49,13 +52,9 @@ try:
 except ImportError:
     _CV_AVAILABLE = False
 
-try:
-    import cv2
-    import numpy as np
+import cv2
+import numpy as np
 
-    _GRASP_CAM_CV_AVAILABLE = True
-except ImportError:
-    _GRASP_CAM_CV_AVAILABLE = False
 
 try:
     from hailo_platform import FormatType, HailoSchedulingAlgorithm, VDevice
@@ -79,28 +78,6 @@ try:
 except ImportError:
     _CPU_YOLO_AVAILABLE = False
 
-
-# ── confirm_grasp (1단계, classical CV 임시 구현) ───────────────────────────
-# YOLO가 아직 안 붙어서(2026-08-21 기준) 실기 로그 수집을 시작하려고 정교한
-# 검출 없이 "기준(빈 그리퍼) 프레임과 지금 프레임이 얼마나 다른가"만 본다.
-# GRASP는 이 결과를 아직 판정에 안 쓴다(domain/task/states.py GraspState 참고) —
-# 로그만 쌓아서 나중에 임계값을 실측으로 잡는다.
-GRIPPER_CAM_DEVICE_DEFAULT = "/dev/gripper_cam"
-GRIPPER_CAM_WIDTH = 640
-GRIPPER_CAM_HEIGHT = 480
-GRIPPER_CAM_WARMUP_FRAMES = 5  # 노출 자동조정 전 프레임은 검게 나온다 (실기 확인됨)
-# 손가락은 프레임 하단 중앙 일부에만 작게 잡힌다(2026-08-21 실기 스냅샷 확인) —
-# 전체 프레임으로 diff를 내면 배경(의자·책상) 변화에 신호가 희석된다. 정확한
-# 비율은 카메라 장착이 바뀌면 같이 바뀌니 재장착 후 스냅샷으로 재확인할 것.
-GRIPPER_CAM_ROI = (0.30, 0.55, 0.70, 1.00)  # (x0, y0, x1, y1), 프레임 폭/높이 비율
-# 실측 4건(2026-08-21, n=1 각각) 기준 임시치 — "실측 확정"은 아니지만 최소한
-# 관측값 안쪽에 두는 게 관측값 밖(15.0)보다 낫다:
-#   빈 그리퍼 4.65 · 축구공(위치 이탈) 1.88 · 별 7.46 · 큐브 10.97
-# 15.0은 네 값 전부보다 커서 confirmed가 상시 False였다(PR #185 리뷰 지적).
-# TODO: 실측 — 케이스를 더 모아 재보정한다. confirm_grasp 로그(diff_score)를
-# 실제 파지 성공/실패 케이스별로 모은다. ros2 param set으로 재배포 없이
-# 튜닝할 수 있게 파라미터로도 노출한다.
-CONFIRM_GRASP_DIFF_THRESHOLD_DEFAULT = 6.0
 
 # ── scan_floor (2026-08-21 신설, 2026-08-23 갱신) ────────────────────────────
 # ⚠️ 클래스별 거리 보정값(CLASS_DISTANCE_CALIBRATION_SQRT_PX_M, 아래 "RGB
@@ -293,8 +270,18 @@ OBSERVE_MIN_BOTTOM_Y_PX = 290.0
 
 # (3) 다중 프레임 합의 — 배경 오검출은 프레임마다 깜빡인다. 2026-08-26의
 # 노트북 오검출은 7프레임 중 2번만 나왔다.
+#
+# ⚠️ 2026-09-01: 5분의 3에서 5분의 2로 낮췄다(사용자 지시 — 실기에서 진짜
+# 물체가 계속 GRASP_BLOCKED로 막혀 테스트가 안 됨). 진짜 rook이 conf
+# 0.97로 잡히는데도 못 찾음으로 나온 사고 중 일부는 아래 force_fresh로
+# 고친 캐시 버그였지만, 그것과 별개로 5프레임 중 3프레임 문턱은 여전히
+# 빡빡하다 — 정지 직후 잔진동이나 조명 변화로 한두 프레임이 흔들리는
+# 것만으로 진짜 물체가 걸린다. 2건 이상 일치는 여전히 배경 오검출(2건
+# 이하로 깜빡이던 노트북 사례)을 거르면서, 실기의 정상적인 흔들림은
+# 덜 막는다. 오검출 쪽 여유가 줄어드는 트레이드오프이므로, 이후 배경
+# 오검출이 다시 새면 이 값부터 되돌아볼 것.
 OBSERVE_CONSENSUS_FRAMES = 5
-OBSERVE_CONSENSUS_MIN_HITS = 3
+OBSERVE_CONSENSUS_MIN_HITS = 2
 
 # 표본을 이만큼 재사용한다. identify_target이 클래스 6개를 연달아 묻는데,
 # 그때마다 5프레임을 새로 뜨면 6배가 든다 — 같은 순간의 같은 표본으로
@@ -453,30 +440,11 @@ class PerceptionNode(Node):
             callback_group=cb_group,
         )
         self.create_service(
-            ConfirmGrasp,
-            "perception/confirm_grasp",
-            self._on_confirm_grasp,
-            callback_group=cb_group,
-        )
-        self.create_service(
             ObserveTarget,
             "perception/observe_target",
             self._on_observe_target,
             callback_group=cb_group,
         )
-
-        self.declare_parameter("gripper_cam_device", GRIPPER_CAM_DEVICE_DEFAULT)
-        self.declare_parameter("confirm_grasp_diff_threshold", CONFIRM_GRASP_DIFF_THRESHOLD_DEFAULT)
-        self._grasp_cam = None
-        self._grasp_cam_reference = None  # 기준(빈 그리퍼) 프레임 — 그레이스케일
-        if _GRASP_CAM_CV_AVAILABLE:
-            self._grasp_cam_reference = self._capture_grasp_frame()
-            if self._grasp_cam_reference is None:
-                self.get_logger().warn(
-                    "confirm_grasp: 기준 프레임 캡처 실패 — 그리퍼캠 연결/조명 확인 필요"
-                )
-        else:
-            self.get_logger().warn("opencv 미설치 — confirm_grasp 항상 confirmed=False 반환")
 
         self.declare_parameter("scan_floor_enabled", SCAN_FLOOR_ENABLED_DEFAULT)
         self.declare_parameter("hailo_hef_path", HAILO_HEF_PATH_DEFAULT)
@@ -767,35 +735,46 @@ class PerceptionNode(Node):
             kept.append((class_name, score, bbox))
         return kept, weak, high
 
-    def _observe_samples(self):
-        """정지 전제 다중 프레임 표본. 캐시가 살아 있으면 재사용한다.
+    def _observe_samples(self, force_fresh=False):
+        """정지 전제 다중 프레임 원본(raw, 게이트 전) 검출 표본. 캐시가
+        살아 있으면 재사용한다.
 
         캐시를 두는 이유: identify_target이 클래스 6개를 연달아 묻는데,
         그때마다 5프레임을 새로 뜨면 6배가 든다. 같은 순간을 묻는 질문이니
-        같은 표본으로 답하는 것이 맞고 더 빠르다."""
+        같은 표본으로 답하는 것이 맞고 더 빠르다.
+
+        ⚠️ 2026-09-01: 예전엔 여기서 바로 게이트까지 걸어(_gate_observe_
+        detections) 클래스 구분 없이 걸러낸 결과만 캐시했다. 그러면
+        "이 클래스가 왜 안 잡혔나"를 정확히 답할 수 없다 — 신뢰도/위치
+        게이트는 클래스 상관없이 프레임 전체 검출에 걸리는데, 어떤 프레임에
+        다른 클래스(예: 배경의 노트북)가 게이트에 걸린 걸 지금 물은 클래스
+        (예: rook)가 걸린 것처럼 보고하면 오히려 헷갈린다. 그래서 게이트를
+        여기서 안 걸고, 호출자(_on_observe_target)가 요청 클래스로 먼저
+        걸러낸 뒤에 그 클래스 후보에만 게이트를 적용하게 바꿨다 — 캐시는
+        원본 검출(raw)만 들고, 클래스별 게이트 집계는 매 호출 새로 한다.
+
+        ⚠️ 2026-09-01 `force_fresh` 추가(실기 사고 대응) — 이 캐시는 원래
+        "6개 클래스를 연달아 묻는 한 라운드 안에서 표본을 공유"하려고
+        만들었는데, 시간(OBSERVE_CACHE_SEC=3.0초)으로만 유효성을 따지다
+        보니 GRASP_ALIGN 재정렬처럼 **판정 라운드 자체가 3초 이내 간격으로
+        반복되는 경로**에서 의도치 않게 새어 나갔다 — 차체가 실제로
+        움직이거나(Host 재직진) Pi가 servo 1로 고친 뒤에도, 다음 라운드가
+        3초 안에 들어오면 그 움직임 **이전**에 찍은 낡은 프레임을 그대로
+        돌려줘 "지금은 잘 보이는데 못 찾음"으로 오답했다. `force_fresh=True`
+        면 캐시 나이와 무관하게 무조건 새로 모은다 — 호출자(Ros2Perception)가
+        매 판정 라운드의 첫 질문에서만 세운다."""
         now = time.monotonic()
-        if (self._observe_samples_cache is not None
+        if (not force_fresh and self._observe_samples_cache is not None
                 and now - self._observe_samples_at < OBSERVE_CACHE_SEC):
             return self._observe_samples_cache
 
         frames = self._collect_cpu_yolo_frames(
             OBSERVE_CONSENSUS_FRAMES, OBSERVE_COLLECT_TIMEOUT_SEC)
-        gated, weak_total, high_total = [], 0, 0
-        for frame_detections in frames:
-            kept, weak, high = self._gate_observe_detections(frame_detections)
-            gated.append(kept)
-            weak_total += weak
-            high_total += high
-        if weak_total or high_total:
-            self.get_logger().info(
-                f"[observe] 게이트 탈락 — 신뢰도<{OBSERVE_CONF_THRESHOLD} {weak_total}건, "
-                f"화면 위쪽(y<{OBSERVE_MIN_BOTTOM_Y_PX:.0f}) {high_total}건 "
-                f"({len(frames)}프레임)")
-        self._observe_samples_cache = gated
+        self._observe_samples_cache = frames
         # 수집을 **마친** 시각을 쓴다. 시작 시각을 쓰면 수집에 걸린 시간이
         # 창에서 먼저 깎여 나가 캐시가 거의 즉시 만료된다.
         self._observe_samples_at = time.monotonic()
-        return gated
+        return frames
 
     def _on_observe_target(self, request, response):
         """정면 목표 하나를 관측한다. GRASP 진입 판정과 파지 확인이 쓴다.
@@ -812,7 +791,16 @@ class PerceptionNode(Node):
 
         CPU YOLO 백엔드 전용. 모델 미로드·프레임 없음·합의 미달은 전부
         found=False — "모르면 실패" 관례. 여러 후보가 있으면 가장 큰(=가까운)
-        것을 고른다."""
+        것을 고른다.
+
+        response.reason: found=False일 때 왜인지(2026-09-01 추가, 사용자
+        지시). 2026-09-01 실기: YOLO는 conf 0.97로 정확히 잡았는데
+        observe_target은 "못 찾음"이었다 — 신뢰도가 아니라 화면 위치
+        게이트(OBSERVE_MIN_BOTTOM_Y_PX)에 걸린 거였는데, 호출자는 found
+        =False만 보고 이유를 알 방법이 없어 bbox를 직접 대조해서야
+        알아냈다. 게이트는 요청 클래스(raw_cls)로 먼저 걸러낸 후보에만
+        적용한다 — 프레임 안 다른 클래스가 게이트에 걸린 걸 지금 물은
+        클래스가 걸린 것처럼 보고하면 안 되기 때문이다."""
         response.found = False
         response.x = 0.0
         response.h = 0.0
@@ -820,22 +808,40 @@ class PerceptionNode(Node):
         response.metric_ok = False
         response.forward_m = 0.0
         response.lateral_m = 0.0
+        response.reason = ""
         if self._cpu_yolo_model is None or self._latest_frame is None:
+            response.reason = ("YOLO 모델 미로드" if self._cpu_yolo_model is None
+                                else "RGB 프레임을 아직 못 받음")
             return response
 
-        samples = self._observe_samples()
+        frames = self._observe_samples(force_fresh=request.force_fresh)
         boxes = []
-        for frame_detections in samples:
-            candidates = [d for d in frame_detections if d[0] == request.raw_cls]
-            if candidates:
+        weak_total = high_total = 0
+        for frame_detections in frames:
+            class_dets = [d for d in frame_detections if d[0] == request.raw_cls]
+            kept, weak, high = self._gate_observe_detections(class_dets)
+            weak_total += weak
+            high_total += high
+            if kept:
                 # 가장 큰 높이 = 가장 가까운 것.
-                boxes.append(max(candidates, key=lambda d: d[2][3] - d[2][1])[2])
+                boxes.append(max(kept, key=lambda d: d[2][3] - d[2][1])[2])
 
         if len(boxes) < OBSERVE_CONSENSUS_MIN_HITS:
             if boxes:
-                self.get_logger().info(
-                    f"[observe] {request.raw_cls} {len(boxes)}/{len(samples)}프레임 — "
-                    f"합의 미달(최소 {OBSERVE_CONSENSUS_MIN_HITS}) → 검출 없음으로 본다")
+                response.reason = (
+                    f"{len(boxes)}/{len(frames)}프레임에서만 잡힘"
+                    f"(다중 프레임 합의 최소 {OBSERVE_CONSENSUS_MIN_HITS}건 필요)")
+            elif weak_total or high_total:
+                parts = []
+                if weak_total:
+                    parts.append(f"신뢰도<{OBSERVE_CONF_THRESHOLD} {weak_total}건")
+                if high_total:
+                    parts.append(f"화면 위치(파지 거리가 아님) {high_total}건")
+                response.reason = " · ".join(parts) + "로 게이트 탈락"
+            else:
+                response.reason = "이 프레임들에서 검출 자체가 없음"
+            self.get_logger().info(
+                f"[observe] {request.raw_cls} 못 찾음 — {response.reason}")
             return response
 
         # 프레임마다 조금씩 흔들리므로 좌표별 중앙값을 쓴다 — 한 프레임이
@@ -914,40 +920,6 @@ class PerceptionNode(Node):
         response.contact_risk = True
         return response
 
-    # ---- confirm_grasp (1단계, classical CV 임시 구현) ----
-    def _open_grasp_cam(self):
-        device = self.get_parameter("gripper_cam_device").value
-        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            cap.release()
-            return None
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, GRIPPER_CAM_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, GRIPPER_CAM_HEIGHT)
-        return cap
-
-    def _capture_grasp_frame(self):
-        """그리퍼캠에서 그레이스케일 프레임 한 장을 잡는다. 카메라가 없거나
-        읽기에 실패하면 **None** — 호출자가 confirmed=False로 접는다.
-
-        열려 있던 캡처가 죽어 있으면(핫플러그 재연결 등) 한 번 다시 연다.
-        노출 자동조정이 끝나기 전 프레임은 실기에서 검게 나오는 게 확인됐으므로
-        (2026-08-21) 앞쪽 몇 프레임은 버린다."""
-        if not _GRASP_CAM_CV_AVAILABLE:
-            return None
-        if self._grasp_cam is None or not self._grasp_cam.isOpened():
-            self._grasp_cam = self._open_grasp_cam()
-        if self._grasp_cam is None:
-            return None
-        for _ in range(GRIPPER_CAM_WARMUP_FRAMES):
-            self._grasp_cam.grab()
-        ok, frame = self._grasp_cam.read()
-        if not ok or frame is None:
-            self._grasp_cam.release()
-            self._grasp_cam = None
-            return None
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
     @staticmethod
     def _letterbox(frame, size):
         """정사각형 size x size로 비율 유지 레터박스한다 (tools/hailo/
@@ -960,46 +932,6 @@ class PerceptionNode(Node):
         x0 = (size - resized.shape[1]) // 2
         canvas[y0 : y0 + resized.shape[0], x0 : x0 + resized.shape[1]] = resized
         return canvas
-
-    def _grasp_roi(self, gray_frame):
-        """GRIPPER_CAM_ROI(비율)를 실제 픽셀 슬라이스로 잘라낸다."""
-        h, w = gray_frame.shape
-        x0, y0, x1, y1 = GRIPPER_CAM_ROI
-        return gray_frame[int(y0 * h) : int(y1 * h), int(x0 * w) : int(x1 * w)]
-
-    def _on_confirm_grasp(self, request, response):
-        frame = self._capture_grasp_frame()
-        if frame is None or self._grasp_cam_reference is None:
-            self.get_logger().warn("confirm_grasp: 프레임/기준 없음 — confirmed=False 반환")
-            response.confirmed = False
-            response.confidence = 0.0
-            return response
-
-        # 기준(빈 그리퍼) 프레임과의 평균 절대 밝기 차이 — 정교한 검출이 아니라
-        # "뭔가 달라졌다"만 보는 1단계 임시 신호다. GRIPPER_CAM_ROI로 손가락
-        # 부근만 잘라서 비교한다 — 전체 프레임으로 하면 배경 변화에 묻힌다
-        # (2026-08-21 실기 확인: 전체 프레임 diff는 물체 유무와 무관하게 ~1로 고정).
-        # threshold는 미실측 자리 표시자이니 로그(diff_score)를 실제 파지
-        # 성공/실패와 대조해 재보정한다.
-        diff_score = float(
-            np.mean(cv2.absdiff(self._grasp_roi(frame), self._grasp_roi(self._grasp_cam_reference)))
-        )
-        threshold = self.get_parameter("confirm_grasp_diff_threshold").value
-        confirmed = diff_score > threshold
-        confidence = max(0.0, min(1.0, diff_score / (2.0 * threshold)))
-
-        self.get_logger().info(
-            f"confirm_grasp: diff_score={diff_score:.2f} threshold={threshold:.2f} "
-            f"confirmed={confirmed} confidence={confidence:.3f}"
-        )
-        response.confirmed = confirmed
-        response.confidence = confidence
-        return response
-
-    def destroy_node(self):
-        if self._grasp_cam is not None:
-            self._grasp_cam.release()
-        super().destroy_node()
 
 
 def main(args=None):

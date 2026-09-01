@@ -365,25 +365,24 @@ def test_접기_전에_그리퍼를_닫는다():
 
 
 # ── E-STOP ────────────────────────────────────────────────────────────────
-
-
-def test_ESTOP이_걸리면_GRASP_조건_판정이_통과하지_않는다():
-    estop = threading.Event()
-    estop.set()
-    host = FakeHostLink([HostCommand(MissionState.GRASP, stop=True)])
-    ports = _ports(host=host, estop=estop)
-
-    nxt = BaselineApproachState().execute(ports)
-
-    assert Report.GRASP_BLOCKED in host.reported_kinds
-    assert isinstance(nxt, BaselineApproachState)
+#
+# ⚠️ 2026-09-01 사용자 지시로 check_grasp()가 더 이상 estop_set을 보지
+# 않는다(preconditions.check_grasp 문서 참고) — E-STOP은 이제 오롯이
+# `BaselineMission.run()`의 최상위 검사(사이클마다 상태 실행 전에 먼저
+# 보고 ESTOP이면 BaselineEstopState로 갈아친다) 하나로만 막는다. 여기
+# 있던 테스트는 `BaselineApproachState().execute()`를 직접 불러 그
+# run() 개입을 건너뛰므로, 이 레이어에서 검증할 계약이 더는 없다 —
+# 지웠다.
 
 
 # ── 정렬 판정 (사용자 지시 2026-08-26) ────────────────────────────────────
 
 
-def test_영역_안에서_치우치면_Pi가_servo1로_고친다():
-    """Host가 아니라 Pi가 고친다 — 차량 제어 원칙의 의도된 예외다."""
+def test_영역_안에서_치우쳐도_그대로_내려간다():
+    """2026-09-01 사용자 지시로 PI_CENTER(servo 1 미세 보정)를 없앴다 —
+    턱 폭 안이면 가운데가 아니어도 servo 1을 건드리지 않고 곧장 파지로
+    간다(grasp_alignment.judge()/baseline_mission._judge_alignment 주석
+    참고)."""
     host = FakeHostLink([HostCommand(MissionState.GRASP, stop=True)])
     arm = FakeArm(load_ratio=EMPTY_LOAD)
     perception = ScriptedPerception(
@@ -392,10 +391,9 @@ def test_영역_안에서_치우치면_Pi가_servo1로_고친다():
 
     nxt = BaselineApproachState().execute(ports)
 
-    assert Report.GRASP_CENTERING in host.reported_kinds
-    assert len(arm.yaw_offsets) == 1
-    assert arm.yaw_offsets[0] > 0.0            # 왼쪽으로 치우쳤으니 왼쪽으로 돈다
-    assert isinstance(nxt, BaselineApproachState)   # 보정 후 다시 관측한다
+    assert Report.GRASP_READY in host.reported_kinds
+    assert arm.yaw_offsets == []               # servo 1 을 아예 건드리지 않는다
+    assert isinstance(nxt, BaselineGraspState)
 
 
 def test_보정_후_곧장_내려가지_않는다():
@@ -436,20 +434,6 @@ def test_전진_거리_밖이면_Host에_재직진을_요구한다():
     assert "재직진" in host.reports[-1][2]
 
 
-def test_servo1이_거부하면_Host에_넘긴다():
-    """한계각을 넘는 보정은 차량이 잘못 선 것이다."""
-    host = FakeHostLink([HostCommand(MissionState.GRASP, stop=True)])
-    arm = FakeArm(load_ratio=EMPTY_LOAD, yaw_offset_ok=False)
-    perception = ScriptedPerception(
-        script=[TargetObservation("queen", JAW_LINE_M + 0.02, 0.040, True)])
-    ports = _ports(host=host, arm=arm, perception=perception)
-
-    BaselineApproachState().execute(ports)
-
-    assert Report.GRASP_BLOCKED in host.reported_kinds
-    assert "재회전" in host.reports[-1][2]
-
-
 def test_거리_환산에_실패하면_내려가지_않는다():
     """metric_ok=False의 0.0을 그대로 쓰면 '바로 앞 정중앙'으로 읽힌다."""
     host = FakeHostLink([HostCommand(MissionState.GRASP, stop=True)])
@@ -475,23 +459,92 @@ def test_턱_선_미실측이면_정렬_판정을_포기하고_Host에_넘긴다
     assert isinstance(nxt, BaselineApproachState)
 
 
-# ── 두 신호 파지 판정 (사용자 지시 2026-08-26) ─────────────────────────────
+# ── 강제 파지 (Host 지시, 2026-08-31) ───────────────────────────────────────
+#
+# Host 가 재정렬을 GRASP_ALIGN_MAX_TRIES 훨씬 넘게 반복해도 계속 영역
+# 밖이면, mission_config.GRASP_FORCE_AFTER_TRIES 문턱에서 MissionState.
+# GRASP_FORCE 로 한 번 강제 진행한다. 여기서 지키려는 성질: **정렬 창
+# (HOST_CORRECTION)만 건너뛴다, 기본 전제와 UNKNOWN(위치를 아예 모름)은
+# 절대 안 건너뛴다.**
 
 
-def test_부하만_높고_목표가_남아있으면_실패로_본다():
-    """턱끼리 물었거나 물체를 쳐 놓은 경우 — 부하 하나로는 못 가른다."""
+def test_GRASP_FORCE는_턱_폭_밖이어도_내려간다():
+    """정상 GRASP 라면 재회전을 요구했을 관측인데, FORCE 는 그대로 진행한다."""
+    host = FakeHostLink([HostCommand(MissionState.GRASP_FORCE, stop=True)])
+    perception = ScriptedPerception(
+        script=[TargetObservation("queen", JAW_LINE_M + 0.02, 0.090, True)])
+    ports = _ports(host=host, arm=FakeArm(load_ratio=EMPTY_LOAD), perception=perception)
+
+    nxt = BaselineApproachState().execute(ports)
+
+    assert Report.GRASP_READY in host.reported_kinds
+    assert "강제" in host.reports[-1][2]
+    assert isinstance(nxt, BaselineGraspState)
+
+
+def test_GRASP_FORCE도_위치를_아예_모르면_안_내려간다():
+    """UNKNOWN(거리 환산 실패)은 force 로도 못 건너뛴다 — 어디 있는지조차 모른다."""
+    host = FakeHostLink([HostCommand(MissionState.GRASP_FORCE, stop=True)])
+    perception = ScriptedPerception(script=[TargetObservation("queen", 0.0, 0.0, False)])
+    ports = _ports(host=host, arm=FakeArm(load_ratio=EMPTY_LOAD), perception=perception)
+
+    nxt = BaselineApproachState().execute(ports)
+
+    assert Report.GRASP_BLOCKED in host.reported_kinds
+    assert isinstance(nxt, BaselineApproachState)
+
+
+def test_GRASP_FORCE도_기본_전제는_안_건너뛴다():
+    """force는 `_judge_alignment`(2단계, 정렬 창)만 건너뛴다 — `check_grasp`
+    (1단계)은 force와 무관하게 항상 본다. 애초에 목표를 못 본 것까지
+    강제로 내려가게 하지는 않는다."""
+    host = FakeHostLink([HostCommand(MissionState.GRASP_FORCE, stop=True)])
+    ports = _ports(host=host, arm=FakeArm(load_ratio=EMPTY_LOAD),
+                   perception=ScriptedPerception())  # 아무것도 안 보임
+
+    nxt = BaselineApproachState().execute(ports)
+
+    assert Report.GRASP_BLOCKED in host.reported_kinds
+    assert isinstance(nxt, BaselineApproachState)
+
+
+def test_GRASP_FORCE도_영역_안이면_그냥_평소대로_내려간다():
+    """이미 READY 인 경우엔 force 문구가 안 붙는다 — 진짜로 강제한 경우만 표시."""
+    host = FakeHostLink([HostCommand(MissionState.GRASP_FORCE, stop=True)])
+    ports = _ports(host=host, arm=FakeArm(load_ratio=EMPTY_LOAD), perception=_centered())
+
+    nxt = BaselineApproachState().execute(ports)
+
+    assert Report.GRASP_READY in host.reported_kinds
+    assert "강제" not in host.reports[-1][2]
+    assert isinstance(nxt, BaselineGraspState)
+
+
+# ── 두 신호 파지 판정 (사용자 지시 2026-08-26, 2026-09-01 AND -> OR) ────────
+#
+# 2026-08-26 ~ 2026-09-01: 부하와 뎁스(confirm_grasp) 둘 다 있어야 성공
+# (AND)이었다. 2026-09-01 실기에서 CARRY 자세는 카메라 프레임 밖이 맞는데도
+# confirm_grasp() 가 "그대로 있다"를 반환했다(뎁스 오탐) — 정상적으로 문턱을
+# 넘은 부하(0.0547)가 그 오탐 하나 때문에 막혔다. 사용자 지시로 **둘 중
+# 하나만 있어도 성공**으로 바꿨다 — 둘 다 실패를 가리킬 때만 진짜 실패다.
+
+
+def test_부하만_높아도_뎁스_오탐과_무관하게_성공이다():
+    """뎁스가 "그대로 있다"고 해도 부하가 충분하면 성공이다(OR)."""
     host = FakeHostLink()
     perception = ScriptedPerception(grasp_confirmed=False)
     ports = _ports(host=host, arm=FakeArm(load_ratio=HOLDING_LOAD), perception=perception)
 
     nxt = BaselineGraspState("queen", 0.02).execute(ports)
 
-    assert Report.GRASP_FAILED in host.reported_kinds
-    assert isinstance(nxt, BaselineApproachState)
+    assert Report.GRASP_DONE in host.reported_kinds
+    assert "뎁스 오탐 무시" in host.reports[-1][2]
+    assert isinstance(nxt, BaselineCarryState)
 
 
-def test_목표는_사라졌는데_부하가_없으면_실패로_본다():
-    """내려오는 그리퍼가 물체를 쳐서 밀어낸 경우 — 뎁스 하나로는 못 가른다."""
+def test_부하가_거의_없으면_뎁스가_뭐라든_실패다():
+    """들어올리기 자체를 못 하면(부하 0.0) OR 판정까지 갈 필요도 없이
+    실패다 — 뎁스만으로 성공을 만들어내지 않는다는 하한선."""
     host = FakeHostLink()
     ports = _ports(host=host, arm=FakeArm(load_ratio=0.0),
                    perception=ScriptedPerception(grasp_confirmed=True))
@@ -502,7 +555,7 @@ def test_목표는_사라졌는데_부하가_없으면_실패로_본다():
     assert isinstance(nxt, BaselineApproachState)
 
 
-def test_두_신호가_모두_있어야_성공이다():
+def test_두_신호가_모두_있으면_당연히_성공이다():
     host = FakeHostLink()
     ports = _ports(host=host, arm=FakeArm(load_ratio=HOLDING_LOAD),
                    perception=ScriptedPerception(grasp_confirmed=True))
@@ -510,6 +563,7 @@ def test_두_신호가_모두_있어야_성공이다():
     nxt = BaselineGraspState("queen", 0.02).execute(ports)
 
     assert Report.GRASP_DONE in host.reported_kinds
+    assert "목표 사라짐 확인" in host.reports[-1][2]
     assert isinstance(nxt, BaselineCarryState)
 
 

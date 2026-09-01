@@ -110,6 +110,16 @@ class Board:
         self.state = PacketControllerState.PACKET_CONTROLLER_STATE_STARTBYTE1
         self.servo_read_lock = threading.Lock()
         self.pwm_servo_read_lock = threading.Lock()
+        # recv_task(읽기 스레드)가 예외 복구로 포트를 닫았다 다시 여는 동안
+        # buf_write(쓰기, 다른 스레드에서 호출)가 같은 self.port에 쓰다 죽는
+        # 것을 막는다(2026-09-01, recv_task 재연결 추가와 같이 도입).
+        #
+        # read()는 이 락으로 안 감싼다 — read()는 timeout=10이라 락 안에서
+        # 하면 쓰기가 최대 10초 막힌다. read()와 write()가 열려 있는 같은
+        # fd에 동시에 접근하는 건(서로 다른 커널 버퍼라) 원래도 안전하다 —
+        # 위험한 건 close()/open()이 read()/write()와 겹치는 순간뿐이라,
+        # 그 구간(재연결)과 write()만 이 락을 같이 쓴다.
+        self._port_lock = threading.Lock()
 
         # 队列用来存储数据(use queue to store data)
         self.sys_queue = queue.Queue(maxsize=1)
@@ -322,7 +332,18 @@ class Board:
         buf.extend(data)
         buf.append(checksum_crc8(bytes(buf[2:])))
         buf = bytes(buf)
-        self.port.write(buf)
+        # 2026-09-01: 이 메서드가 모터·LED·부저·서보 등 모든 쓰기 명령의
+        # 유일한 통로다. 예전엔 여기서 예외가 나면(포트 순간 불안정, 또는
+        # recv_task가 재연결 중인 찰나) 위로 그냥 새서 set_motor_state 같은
+        # ROS 콜백을 조용히 실패시켰다 — 그 명령 하나가 사라졌다는 신호가
+        # 어디에도 안 남았다. cmd_vel 자체가 fire-and-forget 계약이라
+        # (domain/ports/base_driver.py 참고) 여기서 복구할 방법은 없지만,
+        # 적어도 죽지 않고 로그는 남긴다.
+        try:
+            with self._port_lock:
+                self.port.write(buf)
+        except Exception as e:
+            print(f"[buf_write] 시리얼 쓰기 실패({e}) — 이 명령은 유실됨")
         #print(buf)
 
 
@@ -483,7 +504,44 @@ class Board:
     def recv_task(self):
         while True:
             if self.enable_recv:
-                recv_data = self.port.read()
+                try:
+                    recv_data = self.port.read()
+                except Exception as e:
+                    # 2026-09-01 실기 재부팅 직후 확인: 파이가 이 스레드를 시작한
+                    # 시점에 STM32(USB-CDC, /dev/ttyACM0)가 아직 완전히 준비되지
+                    # 않아 "device reports readiness to read but returned no
+                    # data"로 read()가 예외를 던진 사례가 있었다. 이 스레드는
+                    # daemon 스레드라 예외가 나도 노드 프로세스 자체는 안 죽지만,
+                    # 이전에는 여기서 예외가 잡히지 않아 스레드가 그대로
+                    # 종료됐다 — 그러면 모터 등 **쓰기** 경로는 이 스레드와
+                    # 무관해 계속 동작하는데, 배터리/IMU/버튼/조이스틱처럼 이
+                    # 스레드가 파싱해 채우는 **읽기** 경로만 그 프로세스 수명
+                    # 내내 조용히 멈춘다 — 재시작 전까진 겉으로 아무 에러도 안
+                    # 보여서 알아채기 어렵다.
+                    #
+                    # 죽는 대신 포트를 닫았다 다시 열고 계속한다. 재연결
+                    # 자체가 실패해도(장치가 진짜 없어졌다면) 이 루프는 살아
+                    # 있으니 다음 바퀴에서 다시 시도한다 — 예전처럼 한 번의
+                    # 실패로 텔레메트리가 영구히 죽는 일은 없다.
+                    print(f"[recv_task] 시리얼 읽기 실패({e}) — 포트 재연결 시도")
+                    self.state = PacketControllerState.PACKET_CONTROLLER_STATE_STARTBYTE1
+                    self.frame = []
+                    self.recv_count = 0
+                    # close()/open() 사이 fd가 무효한 동안 buf_write()가 같은
+                    # self.port에 쓰지 못하게 여기서만 _port_lock을 잡는다
+                    # (락 설계 근거는 __init__의 _port_lock 주석 참고) — 그
+                    # 동안의 쓰기는 buf_write 쪽에서 짧게 대기했다가 나간다.
+                    with self._port_lock:
+                        try:
+                            self.port.close()
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+                        try:
+                            self.port.open()
+                        except Exception as reopen_err:
+                            print(f"[recv_task] 포트 재연결 실패({reopen_err}) — 0.5s 뒤 다시 시도")
+                    continue
                 if recv_data:
                     for dat in recv_data:
                         # print("%0.2X "%dat)

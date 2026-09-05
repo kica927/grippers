@@ -44,6 +44,7 @@ GRASP와 INSERT만 "한 번의 execute에서 시퀀스 전체를 수행"한다. 
 
 import math
 from dataclasses import dataclass, field
+from typing import Optional
 
 from domain.ports.baseline_ports import MissionState, Report
 from domain.task import baseline_constants as bc
@@ -164,6 +165,48 @@ class LinkWatchdog:
         return self.misses < self.timeout_cycles
 
 
+class ArmLinkWatchdog:
+    """`ports.arm.get_load()`가 연속으로 실패하는지 센다 (2026-09-06 — 벤더
+    시리얼 드라이버(third_party/soarm_provided_d/soarm_lab/driver_sdk.py)에
+    write_timeout이 없어 그리퍼/팔 버스 write()가 한 번 걸리면 그 뒤로 이
+    버스의 모든 서보 통신이 영원히 막히던 결함의 후속). 그날 아침 고쳤지만,
+    write_timeout이 걸려도 "버스가 여전히 응답을 안 준다"는 사실 자체는
+    남을 수 있다 — CARRY 상태는 매 사이클 get_load()를 부르는데, 이게
+    실패하면 그 사이클의 `_drive()` 호출이 지연되고, 그 지연이 STM32
+    쪽 바퀴 모터 워치독(0.5초, ros_robot_controller_sdk.
+    DEFAULT_MOTOR_WATCHDOG_TIMEOUT_S)을 대신 걸리게 한다 — "그리퍼 통신이
+    멈췄는데 증상은 바퀴가 안 도는 것"으로 나타난다(grippers.md Phase 11).
+
+    LivenessLatch(base_liveness.py)와 같은 이유로 래치를 둔다: 실패가
+    `threshold`번 연속되는 순간과, 그 뒤 처음 성공하는 순간에만 한 번씩
+    보고한다 — 매 사이클 보고하면 로그가 이것으로 가득 찬다."""
+
+    def __init__(self, threshold: int = 3) -> None:
+        self.threshold = threshold
+        self.consecutive_failures = 0
+        self.degraded = False
+
+    def observe(self, load: float) -> Optional[str]:
+        """`load`는 `ports.arm.get_load()`의 반환값 그대로다. **None이 아니라
+        음수(-1.0)가 "읽기 실패"다** — `ArmDriver.get_load()`의 포트 계약이고,
+        `BaselineGraspState`의 `load_unknown = carried < 0.0`과 같은 판정을
+        쓴다(ros2_arm_driver.LOAD_UNKNOWN 참고 — 세 계층이 각자 독립적으로
+        정의하는 관례라 여기서도 그 값을 그대로 import하지 않는다). 보고할
+        문장이 있으면 그것을, 없으면 None을 돌려준다."""
+        if load >= 0.0:
+            self.consecutive_failures = 0
+            if self.degraded:
+                self.degraded = False
+                return "그리퍼 부하 읽기 복구됨"
+            return None
+        self.consecutive_failures += 1
+        if not self.degraded and self.consecutive_failures >= self.threshold:
+            self.degraded = True
+            return (f"그리퍼 부하 읽기 {self.consecutive_failures}회 연속 실패 "
+                     "— 그리퍼/팔 버스 write_timeout 의심")
+        return None
+
+
 @dataclass
 class BaselinePorts:
     """Pi 미션이 쓰는 포트 묶음."""
@@ -178,6 +221,9 @@ class BaselinePorts:
     # 구동계 생존 판정의 래치. 워치독과 같은 이유로 여기 한 곳에 둔다 —
     # 상태 객체는 전이마다 새로 만들어지므로 상태를 들고 있을 수 없다.
     base_liveness: LivenessLatch = field(default_factory=LivenessLatch)
+    # 그리퍼/팔 버스 통신 실패 래치 (2026-09-06). 같은 이유로 여기 한 곳에
+    # 둔다 — BaselineCarryState도 전이마다 새로 만들어진다.
+    arm_link: ArmLinkWatchdog = field(default_factory=ArmLinkWatchdog)
 
 
 # ── 공통 동작 ──────────────────────────────────────────────────────────────
@@ -638,7 +684,18 @@ class BaselineCarryState(State):
         # 비교할 직전 표본이 이미 있어야 왕복이 한 번 줄고, 주행 중에 뜬
         # 표본은 자연히 현재와 어긋나므로 "아직 안 멈췄다"가 그대로 드러난다.
         face = ports.lidar.basket_face()
-        self.sample = (face, ports.arm.get_load())
+        load = ports.arm.get_load()
+        self.sample = (face, load)
+
+        # 2026-09-06 — 그리퍼/팔 버스 통신이 여기서 연속으로 막히면(벤더
+        # 드라이버의 write_timeout 결함, ArmLinkWatchdog 정의부 참고) 이
+        # 사이클의 아래 `_drive()` 호출이 늦어져 STM32 바퀴 모터 워치독이
+        # 대신 걸린다 — Host에 원인을 그대로 알려서 "바퀴가 안 도는"
+        # 증상만 보고 바퀴 쪽을 의심하지 않게 한다.
+        arm_link_message = ports.arm_link.observe(load)
+        if arm_link_message is not None:
+            ports.host.report(Report.ARM_LINK_DEGRADED, self.reported_as,
+                              arm_link_message)
 
         if command.state == MissionState.DEBUG_FORCE_INSERT:
             # 테스트 전용 우회로 — 라이다 게이트(check_insert)를 건너뛰고

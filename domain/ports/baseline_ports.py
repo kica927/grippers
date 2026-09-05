@@ -142,6 +142,14 @@ class Report:
     # 나온다(발생 1회, 복구 1회).
     BASE_UNRESPONSIVE = "BASE_UNRESPONSIVE"
 
+    # 그리퍼/팔 버스(get_load) 통신이 연속 실패한다 (2026-09-06 — 벤더
+    # 드라이버의 write_timeout 결함, ArmLinkWatchdog·third_party/
+    # soarm_provided_d/soarm_lab/driver_sdk.py 참고). BASE_UNRESPONSIVE와
+    # 달리 바퀴 자체는 멀쩡하다 — 다만 이 정지가 그 사이클의 바퀴 명령을
+    # 늦춰 STM32 모터 워치독을 대신 걸리게 하므로, 증상만 보면 바퀴 쪽
+    # 문제로 오해하기 쉽다. 상태가 바뀔 때만 나온다(발생 1회, 복구 1회).
+    ARM_LINK_DEGRADED = "ARM_LINK_DEGRADED"
+
 
 @dataclass(frozen=True)
 class HostCommand:

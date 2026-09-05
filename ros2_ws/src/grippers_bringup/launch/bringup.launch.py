@@ -58,12 +58,29 @@ def launch_setup(context):
         ),
         condition=UnlessCondition(use_fake_perception),
     )
-    lidar_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(peripherals_package_path, "launch/lidar.launch.py")
-        ),
-        condition=UnlessCondition(use_fake_perception),
-    )
+    # ⚠️ 2026-09-06 사용자 지시로 라이다 하드웨어 노드를 비활성화했다 —
+    # "괜히 문제 생길 수도 있으니 라이다는 빼자." INSERT 판정의
+    # LIDAR_INSERT_CHECK_ENABLED(domain/task/baseline_constants.py, 이미
+    # False)가 최종 게이트는 껐지만, BaselineCarryState의 접근 중 실시간
+    # "너무 가깝다" 체크(domain/task/corrections.retreat_if_too_close)는
+    # 그 스위치와 무관하게 항상 돌고 있었고, 그게 나이트 실기에서
+    # INSERT_BLOCKED를 20번 연속 낸 원인이었다(2026-09-06 로그 분석).
+    # 여기서 물리 드라이버 노드 자체를 안 띄우면 `/scan_raw`에 아무도
+    # publish하지 않으므로 Ros2Lidar.basket_face()가 항상 "스캔 없음"
+    # (face.ok=False)을 돌려주고, 그 아래 모든 라이다 의존 분기가 자연히
+    # 건드려지지 않는다 — Python 코드(Ros2Lidar, basket_lidar_align,
+    # preconditions.check_insert, corrections.retreat_if_too_close 등)는
+    # 하나도 지우지 않았다(기록으로 남긴다, 사용자 지시) — 바로 위
+    # battery_buzzer_monitor를 뺀 것과 같은 방식(노드만 빼고 코드는
+    # 그대로)이다. 되살리려면 이 주석 블록만 지우고 원래 대입을 복원하면
+    # 된다.
+    lidar_launch = None
+    # lidar_launch = IncludeLaunchDescription(
+    #     PythonLaunchDescriptionSource(
+    #         os.path.join(peripherals_package_path, "launch/lidar.launch.py")
+    #     ),
+    #     condition=UnlessCondition(use_fake_perception),
+    # )
 
     # use_fake_* 는 launch 인자 선언, 하드웨어 노드 guard, orchestrator 파라미터가
     # 모두 맞아야 한다. 하나라도 빠지면 "껐다고 믿었는데 실물이 돌아가는" 상태가
@@ -133,7 +150,7 @@ def launch_setup(context):
     return [
         controller_launch,
         depth_camera_launch,
-        lidar_launch,
+        # lidar_launch,  # 2026-09-06 비활성화 — 위 lidar_launch 정의부 주석 참고.
         perception_node,
         depth_cam_rotate_node,
         arm_driver_node,

@@ -70,10 +70,10 @@
 
 | 항목 | 상태 |
 |---|---|
-| `UdpHostLink` ↔ Host 실제 코드 | 🟡 맥 로컬 적합성 시험(`tools/host_link_conformance.py --translated`)만 통과. Host 저장소가 아직 2026-08-26 확정 이전 규격(`cmd`/`status`)이라 **그대로 붙이면 안 움직인다** — `grippers_docs/grippers_host_requests_20260827.md` 참고 |
+| `UdpHostLink` ↔ Host 실제 코드 | ✅ (2026-09-06 갱신) `HostCommand`가 확정 5필드 규격으로 이미 구현돼 있고, 09-02·09-04 등 실기 커밋 로그에 Host 명령으로 로봇이 실제로 움직인 사건이 다수 있다. 이 줄의 🟡는 8/26 이전 스냅샷이 갱신 안 된 채 남아 있던 것이었다 |
 | `Ros2Lidar` | ✅ 2026-08-27 `basket_approach_insert_test.py`로 여섯 클래스 INSERT 통합 검증에 사용됨 |
 | `Ros2MecanumBase.creep_forward` | ✅ 같은 통합 검증에서 저속 접근·자동정지에 사용됨 |
-| INSERT 좌우 오프셋 게이팅 (`28d4626`) | 🟡 코드만. 오프셋이 허용치를 넘는 상황을 실기로 만들어 ⛔ 분기가 실제로 도는지 확인 필요 |
-| `Ros2Perception.identify_target` | 🔴 클래스를 하나씩 물어보는 방식 — 왕복 6회의 실제 지연 미측정 |
-| 사선 진입 INSERT | 🔴 `BASKET_LATERAL_TOLERANCE_M`(0.070)이 유일한 계산값 — 사선 진입 1회로 실측화 필요 |
-| FSM 전체 통주행 | 🔴 Host 없이는 못 돌린다. `use_fake_host:=true`로 FakeHostLink 경로만 확인 가능 |
+| INSERT 좌우 오프셋 게이팅 (`28d4626`) | ➡️ (2026-09-06 갱신) 이 방식 자체가 Host 쪽 120도 부채꼴 목표영역 게이트(`grippers-host-mac/host/basket_target.py`)로 대체됐다. LiDAR 기반 좌우 오프셋 게이팅은 `LIDAR_INSERT_CHECK_ENABLED=False`로 현재 꺼져 있다 |
+| `Ros2Perception.identify_target` | ✅ (2026-09-06 갱신) 이미 측정돼 있었다 — `baseline_mission.py:328` 주석: "약 1.7초(2026-08-26 실측). 클래스 6개를 묻지만 표본은 한 번만 뜬다"(5프레임 합의 × 프레임당 0.3초). 이 줄의 🔴는 그 뒤 갱신 안 된 것이었다 |
+| 사선 진입 INSERT | 🟡 (2026-09-06 갱신) Host 쪽 부채꼴 게이트로 재설계 후 실기 30도 확인됨(사용자 확인). 15도·극단값(60~75도 근처)은 아직 미확인 — `basket_target.py`에 "이 각도 끝까지 검증 안 함" 경고가 남아 있음 |
+| FSM 전체 통주행 | ✅ (2026-09-06 갱신) Host 붙인 채로 반복 실주행 확인됨(위 UdpHostLink 항목 참고) |

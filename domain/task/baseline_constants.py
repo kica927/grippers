@@ -96,7 +96,7 @@ GRASP_CREEP_OPEN_LOOP_SEC = 1.5  # 지시(2026-09-02)
 # 기존 테스트(턱 폭 밖 판정 여유 14.5mm, 턱 선 근접 판정 여유 50mm)를
 # 깨지 않는 선에서 잡았다 — **아직 실기 미검증**, 내일 GRASP 진입 빈도가
 # 실제로 느는지 지켜볼 것.
-GRASP_ALIGN_TOLERANCE_MM = 10.0  # 지시(2026-09-01) — 이후 실기에서 문제 안 일으켜 그대로 사용(2026-09-06 사용자 확인)
+GRASP_ALIGN_TOLERANCE_MM = 10.0  # 지시(2026-09-01) — 실기 미검증
 
 # 교시 파지 자세가 전제하는 물체 중심 위치(차체 전면 기준 전방).
 # floor_grasp_profiles.GRASP_OBJECT_CENTER_FORWARD_MM과 같은 값이다.

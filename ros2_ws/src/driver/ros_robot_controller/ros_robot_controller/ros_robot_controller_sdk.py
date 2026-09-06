@@ -422,8 +422,15 @@ class Board:
             time.sleep(self._motor_watchdog_poll)
             idle_s = time.monotonic() - self._last_motor_cmd_at
             if idle_s > self._motor_watchdog_timeout:
-                print(f"[motor_watchdog] {idle_s:.2f}초 동안 새 모터 명령이 "
-                      f"없습니다 — 0속도를 강제 전송합니다", flush=True)
+                # 2026-09-06 — 벽시계 타임스탬프(time.time(), 초 단위 epoch)를
+                # 앞에 붙인다. tools/correlate_arm_motor_stall.py가 이 줄과
+                # driver_sdk.py의 [driver] WRITE_TIMEOUT 줄(서로 다른 ROS2
+                # 노드/프로세스라 로거 형식이 다르다)을 같은 잣대로 맞춰 보려면
+                # 사람이 안 읽어도 되는 단순한 수치 시각이 필요하다 — idle_s와
+                # 합쳐 "이 정지가 언제 시작됐는가"(time.time() - idle_s)까지
+                # 역산할 수 있다.
+                print(f"[{time.time():.3f}] [motor_watchdog] {idle_s:.2f}초 동안 "
+                      f"새 모터 명령이 없습니다 — 0속도를 강제 전송합니다", flush=True)
                 self.set_motor_speed([[1, 0.0], [2, 0.0], [3, 0.0], [4, 0.0]])
     
     '''

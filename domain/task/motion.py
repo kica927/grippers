@@ -67,6 +67,82 @@ AGREED_ROTATION_RAD_S = 0.25
 # 0.06으로 실행되고, 그 사실을 보고에 적는다.
 BASKET_APPROACH_MPS = 0.06
 
+# RETURN_HOME 전용 상향 상한 (2026-09-06, 사용자 지시 — "도전이긴 한데
+# 시간을 조금만 줄일 수 있을까"). RETURN_HOME은 기물을 포기했거나 하나를
+# 다 옮긴 뒤 mcfg.DEFAULT_HOME_XY로 돌아가기만 하는 구간이라, GRASP/INSERT
+# 처럼 정밀 판정에 걸리는 지연 민감도가 없다 — 그래서 이 구간에서만 더
+# 빠르게 달려도 된다.
+#
+# 값 선정 근거:
+#   RETURN_HOME_LINEAR_MPS=0.2 — odom_publisher_node.app_cmd_vel_callback의
+#     하드 캡(0.2 m/s)과 정확히 같다. 그 위로는 Pi가 어차피 다시 잘라서
+#     의미가 없다.
+#   RETURN_HOME_ROTATION_RAD_S=0.3 — 순수 회전 데드밴드 펄싱의 문턱인
+#     ROTATE_BURST_SPEED_RAD_S(0.4, ros2_mecanum_base.py)보다 여전히
+#     작다 — 즉 이 값을 올려도 펄싱 경로(껐다 켰다 하는 버스트)가 그대로
+#     유지되고, duty만 0.25/0.4=0.625에서 0.3/0.4=0.75로 조금 늘 뿐이다.
+#     0.4 이상으로 올렸다면 펄싱을 완전히 우회해 다른 동작이 됐을
+#     것이므로 일부러 그 아래로 잡았다.
+#
+# ⚠️ 실기 미검증이다 — 회전이 빨라지면 오버슈트 폭도 커져서 yaw 헌팅
+# (mission_config.ROTATE_OSCILLATION_TOGGLE_LIMIT 참고)이 오히려 심해질
+# 가능성이 있다. 다음 실기에서 RETURN_HOME 구간의 회전 왕복이 늘었는지
+# 반드시 확인할 것.
+#
+# ⚠️ 2026-09-06 실기 확인 — 이 상수들 자체는 문제가 아니었다. 아래
+# `_HOST_STATE_SPEED_OVERRIDE`를 **상한(clamp 캡)**으로만 처음 구현했었는데,
+# Host의 encode()는 이 구간에서도 항상 AGREED_LINEAR_MPS/AGREED_ROTATION_
+# RAD_S 고정값만 실어 보낸다(vehicle_link.encode()의 네 가지 동작 참고,
+# RETURN_HOME이라고 더 큰 값을 보내는 분기가 없다). `_clamp`는 "값이 캡보다
+# 크면 캡으로 자르는" 함수라 min(0.25, 0.3)=0.25로, 캡을 아무리 올려도
+# **원래 값 밑으로는 절대 안 올라간다.** 실기 로그(apply_velocity 인자)에서
+# RETURN_HOME 내내 각속도가 그대로 0.25로 나가는 것으로 확증했다 — 사용자가
+# "속도 별 차이 없다"고 보고한 그대로였다.
+#
+# 사용자가 애초에 제안한 설계("host가 RETURN_HOME을 보내면 pi에서 속도에
+# 배수를 준다")를 그대로 따랐어야 했다 — 아래 resolve_motion()은 이제 캡이
+# 아니라 **배수**로 스케일업한 뒤, 그 결과를 다시 캡으로 한 번 더 잘라
+# 안전판을 유지한다.
+RETURN_HOME_LINEAR_MPS = 0.2
+RETURN_HOME_ROTATION_RAD_S = 0.3
+
+# APPROACH_PIECE/CARRY_TO_DEST 전용 상향 상한 (2026-09-06, 사용자 지시 —
+# "APPROACH_PIECE/CARRY_TO_DEST 정도만 전진 0.18, 회전 0.28로 상향").
+# RETURN_HOME(0.2/0.3)보다 보수적으로 잡은 값이다 — 이 두 구간은
+# RETURN_HOME과 달리 정밀 판정이 걸려 있다: APPROACH_PIECE는 GRASP 트리거
+# 거리 판정을, CARRY_TO_DEST는 물체를 든 채 이동(파지력이 아니라 흔들림이
+# 원인일 수 있는 낙하 사고, 2026-09-06 knight 2회)을 각각 겪는다. GRASP_
+# ALIGN/GRASP_REPLAN(같은 호스트 어휘로 APPROACH에 매핑되지만 원본 이름은
+# 다르다)과 FACE_BOX/NUDGE_BOX/PLACE(바구니 근접 정렬)는 대상이 아니다 —
+# host_state로 구분하므로 정확히 이 두 이름만 걸린다.
+#
+# 실기 확인(2026-09-06, rook/knight/queen 3구간 전부 성공, 구동계·그리퍼
+# 경보 없음) 직후 사용자가 "좀 빠르네"라며 선속만 0.18 -> 0.14로 낮췄다.
+# 회전(0.28)은 그대로 둔다 — 사용자가 선속만 지목했다.
+#
+# 0.14 < Pi 하드캡(0.2, odom_publisher_node.app_cmd_vel_callback) — 하드캡을
+# 넘겨 봐야 조용히 잘려 상수가 무의미해지는 일이 없다. 데드밴드(0.05,
+# AGREED_LINEAR_MPS 주석 참고)보다는 위라 실제로 돈다.
+# 0.28 < 데드밴드 펄싱 문턱(0.4, ROTATE_BURST_SPEED_RAD_S) — 순수 회전이
+# 펄싱 경로를 벗어나지 않는다.
+#
+# ⚠️ 회전(0.28)과 CARRY_TO_DEST 구간 자체는 여전히 실기 1회 검증이다 —
+# knight 낙하가 이번엔 없었지만(그리퍼 토크 상향과 겹친 실행이라 어느 쪽
+# 효과인지 아직 못 가른다), 계속 지켜볼 것.
+APPROACH_CARRY_LINEAR_MPS = 0.14
+APPROACH_CARRY_ROTATION_RAD_S = 0.28
+
+# HostCommand.host_state(Host 원본 FSM 상태 이름)가 이 표에 있으면 그
+# (linear_cap, angular_cap) 쌍을 쓴다. 표에 없거나 host_state가 빈 문자열
+# (구버전 Host와의 하위호환)이면 기본값(AGREED_LINEAR_MPS/ROTATION_RAD_S)
+# 그대로 — "모르면 원래 값" 관례. HostCommand.host_state 정의부(순환
+# import를 피하려고 여기서 문자열을 직접 적는다) 참고.
+_HOST_STATE_SPEED_OVERRIDE = {
+    "RETURN_HOME": (RETURN_HOME_LINEAR_MPS, RETURN_HOME_ROTATION_RAD_S),
+    "APPROACH_PIECE": (APPROACH_CARRY_LINEAR_MPS, APPROACH_CARRY_ROTATION_RAD_S),
+    "CARRY_TO_DEST": (APPROACH_CARRY_LINEAR_MPS, APPROACH_CARRY_ROTATION_RAD_S),
+}
+
 # 부동소수 잡음을 0으로 본다. UDP+JSON을 거치며 0.0이 1e-17로 오는 경우가
 # 있는데, 그걸 "회전 명령"으로 읽으면 병진과 섞였다고 오판해 거부한다.
 EPSILON = 1e-6
@@ -118,6 +194,20 @@ def _clamp(value: float, limit: float) -> float:
     return math.copysign(min(abs(value), limit), value)
 
 
+def _scale_and_clamp(value: float, agreed: float, cap: float) -> float:
+    """`value`(항상 0 아니면 ±agreed 둘 중 하나 — Host encode()의 이산
+    어휘 참고)를 cap 크기로 비례 확대한 뒤 다시 cap으로 자른다.
+
+    `_clamp`와 다른 점: `_clamp(0.25, 0.3)`은 0.25를 그대로 돌려준다(캡을
+    올려도 원래 값 밑으로는 못 올라간다) — RETURN_HOME 상향이 실기에서
+    아무 효과가 없었던 그 버그다. 여기서는 대신 (cap/agreed) 배수를 먼저
+    곱해 0.25 -> 0.3으로 실제로 올린다. agreed가 0이면(설정 실수) 배수
+    계산이 무의미하므로 안전하게 그냥 캡으로 자른다."""
+    if agreed <= 0.0:
+        return _clamp(value, cap)
+    return _clamp(value * (cap / agreed), cap)
+
+
 def resolve_motion(command) -> MotionDecision:
     """`HostCommand`를 실제 속도로 바꾼다.
 
@@ -145,13 +235,36 @@ def resolve_motion(command) -> MotionDecision:
 
     # 바구니로 붙는 구간만 더 낮은 상한을 쓴다. 회전은 안 낮춘다 — 회전은
     # 한 사이클에 1.8도라 이미 허용치(5도)의 3분의 1이다.
-    linear_cap = (BASKET_APPROACH_MPS if command.state == _APPROACH_BOX
-                  else AGREED_LINEAR_MPS)
-    motion = Motion(
-        linear_x=_clamp(command.linear_x, linear_cap),
-        linear_y=_clamp(command.linear_y, linear_cap),
-        angular_z=_clamp(command.angular_z, AGREED_ROTATION_RAD_S),
-    )
+    #
+    # 2026-09-06: RETURN_HOME은 반대로 **올린다** — command.state(Host·Pi
+    # 합의 어휘)가 아니라 command.host_state(Host 원본 상태 이름)로 판단한다.
+    # 이 둘은 절대 동시에 안 걸린다 — RETURN_HOME일 때 state는 항상
+    # APPROACH지 APPROACH_BOX가 아니다. 그래도 바구니 저속 캡을 if/elif로
+    # 먼저 두어, 혹시 표가 잘못 채워지는 미래의 사고에도 "안전 쪽(저속)"이
+    # 항상 이기게 한다.
+    linear_cap, angular_cap = AGREED_LINEAR_MPS, AGREED_ROTATION_RAD_S
+    boosted = False
+    if command.state == _APPROACH_BOX:
+        linear_cap = BASKET_APPROACH_MPS
+    elif command.host_state in _HOST_STATE_SPEED_OVERRIDE:
+        linear_cap, angular_cap = _HOST_STATE_SPEED_OVERRIDE[command.host_state]
+        boosted = True
+
+    if boosted:
+        # Host가 이 필드들에 싣는 크기는 항상 0 아니면 AGREED_* 고정값
+        # 하나뿐이다(encode() 참고) — clamp만으로는 상한을 올려도 그
+        # 고정값 밑으로 못 올라가므로, 여기서만 배수로 실제로 밀어올린다.
+        motion = Motion(
+            linear_x=_scale_and_clamp(command.linear_x, AGREED_LINEAR_MPS, linear_cap),
+            linear_y=_scale_and_clamp(command.linear_y, AGREED_LINEAR_MPS, linear_cap),
+            angular_z=_scale_and_clamp(command.angular_z, AGREED_ROTATION_RAD_S, angular_cap),
+        )
+    else:
+        motion = Motion(
+            linear_x=_clamp(command.linear_x, linear_cap),
+            linear_y=_clamp(command.linear_y, linear_cap),
+            angular_z=_clamp(command.angular_z, angular_cap),
+        )
     slowed = (linear_cap < AGREED_LINEAR_MPS
               and (abs(command.linear_x) > linear_cap + EPSILON
                    or abs(command.linear_y) > linear_cap + EPSILON))
@@ -160,4 +273,9 @@ def resolve_motion(command) -> MotionDecision:
             True, motion,
             f"바구니 접근 구간이라 {linear_cap:.2f} m/s로 낮췄다 "
             f"(명령 {max(abs(command.linear_x), abs(command.linear_y)):.2f})")
+    if linear_cap > AGREED_LINEAR_MPS or angular_cap > AGREED_ROTATION_RAD_S:
+        return MotionDecision(
+            True, motion,
+            f"{command.host_state} 구간이라 속도를 올렸다 "
+            f"(선속 상한 {linear_cap:.2f} m/s, 각속 상한 {angular_cap:.2f} rad/s)")
     return MotionDecision(True, motion)

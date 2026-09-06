@@ -176,6 +176,23 @@ class HostCommand:
     # 그 값이 어디서 왔는지 모른 채 실행만 한다. 0.0이면 보정 없음(safe_300
     # 단계 자체를 건너뛴다 — BaselineInsertState 참고).
     yaw_correction_deg: float = 0.0
+    # Host의 세분화된 FSM 상태 이름 원본(예: "RETURN_HOME") — 2026-09-06,
+    # 사용자 지시로 RETURN_HOME 구간만 더 빠르게 달리게 하려고 추가했다.
+    #
+    # 이건 위 `state`(IDLE/APPROACH/GRASP/... — Host·Pi가 "같은 이름으로
+    # 부르는" 합의 어휘, MissionState 참고)와 다른 것이다. RETURN_HOME은
+    # GRASP_ALIGN·GRASP_REPLAN과 함께 전부 `state=APPROACH`로 뭉개진다
+    # (vehicle_link._STATE_TO_PI 참고) — Pi FSM은 그걸로 충분하다(셋 다
+    # "순수 주행, 판정 불필요"라 같은 처리로 맞다). 그런데 속도 상한만은
+    # 상태별로 다르게 주고 싶어서, FSM 디스패치에 쓰는 `state`는 그대로
+    # 두고 이 필드 하나만 "속도 결정용 힌트"로 옆에 추가했다.
+    #
+    # ⚠️ 이 필드는 오직 `domain/task/motion.py`의 속도 상한 결정에만 쓴다.
+    # Pi의 상태 분기(BaselineApproachState 등)는 절대 이 필드를 보면 안
+    # 된다 — 그러면 `state`와 다른 이야기를 하는 두 소스가 생겨 혼선이
+    # 난다. 모르는 값이거나 빈 문자열("", 구버전 Host와의 하위호환)이면
+    # 반드시 안전한 기본 속도로 폴백해야 한다 — "모르면 원래 값" 관례.
+    host_state: str = ""
 
     @property
     def wants_motion(self) -> bool:

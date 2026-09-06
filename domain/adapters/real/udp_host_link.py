@@ -1,18 +1,21 @@
 """UdpHostLink — HostLink 포트의 실기 구현. Host PC와 UDP+JSON으로 말한다.
 
 프로토콜은 Host 쪽 `VEHICLE_LINK_PROTOCOL.md`가 단일 소스다. 팀이
-2026-08-26에 확정한 다섯 필드에 더해, 2026-09-05에 `yaw_correction_deg`
-(safe_300 — INSERT가 그리퍼를 열기 전 servo 1로 흡수할 잔여 지향 오차,
-도 단위)를 여섯 번째로 추가했다:
+2026-08-26에 확정한 다섯 필드에, 2026-09-05에 `yaw_correction_deg`를
+여섯 번째로, 2026-09-06에 `host_state`를 일곱 번째로 추가했다:
 
     state · linear_x · linear_y · angular_z · stop · yaw_correction_deg
+    · host_state
 
-Host가 이 여섯 외의 필드를 더 보내도 무시한다 — 좌표나 경로가 섞여
+Host가 이 일곱 외의 필드를 더 보내도 무시한다 — 좌표나 경로가 섞여
 들어오더라도 Pi가 그것을 읽기 시작하는 순간 역할 분담이 무너지기
 때문이다. yaw_correction_deg는 예외로 추가됐다 — angular_z(차체 회전
 속도)처럼 Host가 계산한 각도 하나를 Pi가 그대로 실행만 하는 값이라
 "공간을 아는 것은 Host뿐"이라는 원칙을 어기지 않는다(HostCommand
-docstring 참고).
+docstring 참고). host_state도 같은 이유로 예외다 — 좌표·경로가 아니라
+Host 자신이 지금 어느 이름의 상태에 있는지, 문자열 라벨 하나일
+뿐이다(resolve_motion의 RETURN_HOME 속도 상향 전용, HostCommand.host_state
+정의부 참고 — Pi의 상태 분기 로직은 이 필드를 보지 않는다).
 
 ## 왜 최신 것만 보는가
 
@@ -88,6 +91,7 @@ class UdpHostLink:
             self._warn("Host 패킷에 state가 없다 — 버림")
             return None
         try:
+            host_state = data.get("host_state", "")
             return HostCommand(
                 state=state,
                 linear_x=float(data.get("linear_x", 0.0)),
@@ -95,6 +99,11 @@ class UdpHostLink:
                 angular_z=float(data.get("angular_z", 0.0)),
                 stop=bool(data.get("stop", False)),
                 yaw_correction_deg=float(data.get("yaw_correction_deg", 0.0)),
+                # 구버전 Host는 이 필드를 아예 안 보낸다 — get() 기본값("")
+                # 이 그대로 "모르면 원래 속도"로 이어진다(motion.py 참고).
+                # 문자열이 아닌 값이 오면 빈 문자열로 접는다 — 이 필드가
+                # 망가져도 최악의 결과가 "기본 속도"지 잘못된 상향이 아니다.
+                host_state=host_state if isinstance(host_state, str) else "",
             )
         except (TypeError, ValueError):
             self._warn("Host 패킷의 속도 필드가 수치가 아니다 — 버림")

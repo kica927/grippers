@@ -44,3 +44,8 @@ docker exec -u ubuntu IntelPi bash -c '/grippers/tools/ops/bringup_now.sh 192.16
 echo ""
 echo "=== 노드 확인 ==="
 docker exec -u ubuntu IntelPi bash -c 'source /opt/ros/humble/setup.bash && ros2 node list'
+
+echo ""
+echo "=== 스냅샷 기록 (/tmp/bringup_audit.log, 컨테이너 안) ==="
+docker exec -u ubuntu IntelPi bash -c '/grippers/tools/ops/node_snapshot.sh AFTER_BRINGUP_READY' \
+  || echo "⚠️ 스냅샷 기록 실패 — node_snapshot.sh 가 배포됐는지 확인하세요."

@@ -23,9 +23,24 @@ set -eo pipefail
 # <defunct>(좀비)는 제외 — 이미 죽은 프로세스라 자원을 안 쥐고 있고,
 # 부모가 reap 하면 곧 사라진다. 여기서 걸러야 할 건 "진짜 살아서 포트를
 # 쥐고 있는" 프로세스뿐이다.
+#
+# ⚠️ 2026-09-06 실기로 확인한 버그를 여기서 고쳤다: 이 목록은 원래
+# "arm_driver_node"와 "ekf_node"를 포함했는데, 실제 `ps` 명령줄에는 그
+# 문자열이 **절대 나오지 않는다**. arm_driver_node는 ROS 그래프 노드
+# 이름일 뿐이고 실행 파일은 `arm_driver`다(`ps -eo cmd | grep
+# arm_driver_node`는 항상 매치 0건이었다 — Pi 실기로 재현·확인). ekf_node는
+# grippers_bringup 자체가 애초에 안 띄운다(bringup.launch.py 주석 참고 —
+# imu_calib 부재로 controller.launch.py 전체를 못 써서 odom_publisher만
+# 직접 포함하고 EKF는 뺐다). 그래서 이 STALE 점검은 이전 세션이 남긴
+# arm_driver 프로세스를 절대 못 잡고, 그 위에 새 arm_driver 를 또 띄워
+# 둘이 같은 시리얼 포트(/dev/soarm)를 두고 충돌하는 사고로 이어질 수
+# 있었다 — run_mission.py 를 한 번 끝내고 다시 실행했을 때만 모터(팔)가
+# 안 움직이는 증상과 일치한다.
 STALE=$(ps -eo cmd | grep -E \
-  'ros_robot_controller|odom_publisher|ekf_node|joint_state_publisher|ascamera_node|arm_driver_node|perception_node|robot_state_publisher' \
+  'ros_robot_controller|odom_publisher|joint_state_publisher|ascamera_node|arm_driver|perception_node|robot_state_publisher' \
   | grep -v grep | grep -v defunct || true)
+
+/grippers/tools/ops/node_snapshot.sh BEFORE_BRINGUP > /dev/null || true
 
 if [ -n "$STALE" ]; then
   echo "이미 떠 있는 노드가 있습니다 — 먼저 stop_bringup.sh 를 돌리세요:"
@@ -71,3 +86,8 @@ LAUNCH_PID=$!
 # setsid 로 새 프로세스 그룹의 리더가 됐으므로 PGID == PID.
 echo "$LAUNCH_PID" > "$PGID_FILE"
 echo "launch PID/PGID = $LAUNCH_PID (기록: $PGID_FILE)"
+
+# 이 시점엔 노드들이 아직 초기화 중이라 "준비 완료" 스냅샷은 아니다 —
+# PGID가 실제로 기록됐는지, launch 직후 시점의 프로세스 상태가 어떤지만
+# 남긴다. 노드가 다 뜬 뒤의 스냅샷은 test_ready.sh(3/3 뒤)가 따로 찍는다.
+/grippers/tools/ops/node_snapshot.sh AFTER_LAUNCH_TRIGGERED > /dev/null || true

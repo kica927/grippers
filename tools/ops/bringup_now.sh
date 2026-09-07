@@ -13,12 +13,44 @@
 # 이 스크립트는 .robotrc 가 하는 sourcing 전부를 bash에서 그대로 재현하고,
 # 시작 전에 이미 떠 있는 노드가 있는지부터 확인해서 중복 기동을 막는다.
 # kill 은 안 한다 — 뭔가 남아 있으면 stop_bringup.sh 를 먼저 돌리라고
-# 알려주고 여기서 멈춘다.
+# 알려주고 여기서 멈춘다. 단 하나, 아래 "부팅 자동 실행 컨트롤러" 정리만
+# 예외다 — stop_bringup.sh 로는 애초에 못 끄는 대상이라 안내해 봐야
+# 막다른 길이기 때문이다(바로 아래 주석 참고).
 
 set -eo pipefail
 # -u(미설정 변수 금지)는 안 쓴다 — ROS의 setup.bash 들이 AMENT_TRACE_
 # SETUP_FILES 같은 변수를 먼저 체크 없이 참조해서(벤더 코드, 우리가 못
 # 고침) -u 아래서는 소싱 자체가 죽는다.
+
+# ── 부팅 때 자동 실행된 컨트롤러부터 치운다 ──────────────────────────────
+#
+# Pi 는 부팅하면 ros_robot_controller 를 자동으로 띄운다. bringup 도
+# controller/odom_publisher.launch.py 로 자체 컨트롤러를 띄우므로, 그대로
+# 두면 **두 프로세스가 같은 시리얼 포트를 문다.**
+#
+# ⚠️ 증상이 고약하다 — 소프트웨어는 끝까지 정상으로 보인다. 노드 다 뜨고,
+# cmd_vel 도 나가고, set_motor 도 정상값이 찍히는데 **바퀴만 안 돈다.**
+# /odom_raw 는 명령을 되읽는 추측항법이라 오히려 "돌고 있다"고 말한다
+# (sysy009, vla-dp 브랜치 커밋 38fdabd, 2026-09-07 — "이것으로 몇 시간을
+# 태웠고, 재부팅 뒤 중복 컨트롤러를 없애자마자 바퀴가 돌았다").
+#
+# 이걸 여기서 자동으로 치우는 이유(위 "kill 은 안 한다" 원칙의 유일한
+# 예외): 이 프로세스는 bringup_now.sh 가 띄운 게 아니라 부팅 시 OS가
+# 띄운 것이라 /tmp/bringup.pgid 에 없다 — stop_bringup.sh 는 그 파일이
+# 없으면 그대로 실패한다. 즉 아래 STALE 체크가 이 프로세스를 걸러 "먼저
+# stop_bringup.sh 를 돌리세요"라고 안내해도, 그대로 따라가면 stop_bringup.sh
+# 도 실패하는 막다른 길이다 — 사람이 개입해도 다음 수가 없다는 뜻이라,
+# 이 좁은 조건(bringup.launch 가 전혀 안 떠 있을 때만)에서만 예외적으로
+# 직접 정리한다. bringup.launch 가 이미 떠 있으면 절대 안 건드린다 — 그건
+# 그 bringup 의 컨트롤러이지 자동 실행분이 아니다.
+if ! pgrep -f "bringup.launch" >/dev/null 2>&1; then
+  STRAY=$(pgrep -f "ros_robot_controller" || true)
+  if [ -n "$STRAY" ]; then
+    echo "[bringup_now] 부팅 자동 실행 ros_robot_controller 정리 — 시리얼 포트 중복 방지"
+    pkill -9 -f "ros_robot_controller" 2>/dev/null
+    sleep 3
+  fi
+fi
 
 # <defunct>(좀비)는 제외 — 이미 죽은 프로세스라 자원을 안 쥐고 있고,
 # 부모가 reap 하면 곧 사라진다. 여기서 걸러야 할 건 "진짜 살아서 포트를

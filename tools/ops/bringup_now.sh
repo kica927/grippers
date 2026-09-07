@@ -76,7 +76,24 @@ source /ros2_ws/install/setup.bash
 LOG=/tmp/bringup.log
 PGID_FILE=/tmp/bringup.pgid
 
-echo "기동 중 — 로그: $LOG, 정지: stop_bringup.sh"
+# 2026-09-07, 2차 회전정지 사고 후속 — $LOG는 컨테이너 자체의 오버레이
+# 파일시스템(/tmp) 안에 있어서, 컨테이너가 재시작되면(재부팅 등) 통째로
+# 사라진다. 정지 안 되는 사고의 최후 수단이 하필 재부팅/전원차단인데,
+# 그 순간 가장 필요한 증거가 같이 지워지는 구조였다(2차 사고 때 실제로
+# 이걸로 로그를 통째로 잃었다 — bringup.log도 dmesg도 둘 다 컨테이너/
+# 커널 재시작에 안 살아남는 곳에만 있었다). 호스트에 바인드 마운트된
+# /shared(재부팅에도 살아남는다, docker inspect로 확인)에도 실시간으로
+# 같은 내용을 미러링해 둔다 — 메인 launch의 프로세스 그룹(stop_bringup.sh가
+# 이걸로 죽인다)과는 별개의 tail 프로세스라, 이게 실패해도 bringup 자체엔
+# 영향이 없다.
+PERSIST_DIR=/shared/bringup_logs
+mkdir -p "$PERSIST_DIR" 2>/dev/null || true
+PERSIST_LOG="$PERSIST_DIR/bringup_$(date -u +%Y%m%dT%H%M%SZ).log"
+touch "$LOG"
+pkill -f "tail -n \+1 -F $LOG" 2>/dev/null || true
+( tail -n +1 -F "$LOG" > "$PERSIST_LOG" 2>/dev/null & ) 2>/dev/null || true
+
+echo "기동 중 — 로그: $LOG (호스트 사본: $PERSIST_LOG), 정지: stop_bringup.sh"
 setsid ros2 launch grippers_bringup bringup.launch.py \
   use_fake_base:=false use_fake_arm:=false use_fake_perception:=false \
   host_ip:="${1:-192.168.0.9}" \

@@ -197,14 +197,17 @@ def test_offset_base_yaw_and_drop_yaw_correction_use_separate_limits():
     미션에서 60도 근처 보정이 드랍 지점을 바구니 벽 쪽으로 몰아
     "아슬아슬"한 경우가 나와 45도로 낮췄고, 45도에서도 같은 지적이 남아
     20도까지 낮췄다가, 20도가 지나치게 좁다고 판단해 30도로 다시 올렸다.
-    GRASP 좌우보정의 물리적 근거가 있는 ±15도(MAX_BASE_YAW_OFFSET_RAD)는
-    절대 같이 넓어지면 안 된다. 두 공개 핸들러가 서로 다른 한계 상수를
+    2026-09-07 — facing_offset_from_square() 버그 수정 후 실제 잔여오차가
+    처음으로 정확히 보고되면서 30도 한계에 두 번(+41.4도·+36.4도) 걸려
+    거부됐다 — 사용자 지시로 45도로 다시 올렸다("45도로 해줘"). GRASP
+    좌우보정의 물리적 근거가 있는 ±15도(MAX_BASE_YAW_OFFSET_RAD)는 절대
+    같이 넓어지면 안 된다. 두 공개 핸들러가 서로 다른 한계 상수를
     공유 구현(_offset_base_yaw_impl)에 넘기는지 직접 확인한다."""
     # 두 상수는 math.radians(...) 호출이라 _module_constants의
     # literal_eval로는 못 읽는다 — 소스에서 문자열로 직접 확인한다.
     source = ARM_NODE.read_text(encoding="utf-8")
     assert "MAX_BASE_YAW_OFFSET_RAD = math.radians(15.0)" in source
-    assert "MAX_DROP_YAW_OFFSET_RAD = math.radians(30.0)" in source
+    assert "MAX_DROP_YAW_OFFSET_RAD = math.radians(45.0)" in source
 
     offset_fn = _function("_on_offset_base_yaw")
     drop_fn = _function("_on_drop_yaw_correction")

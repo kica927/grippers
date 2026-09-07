@@ -101,6 +101,60 @@ DEFAULT_WRITE_TIMEOUT_S = 0.2
 DEFAULT_MOTOR_WATCHDOG_TIMEOUT_S = 0.5
 DEFAULT_MOTOR_WATCHDOG_POLL_S = 0.05
 
+# 회전 정지 확인(2026-09-07 실기 사고 후속) — 모터 워치독이 0속도를 재전송
+# "성공"해도(예외 없음) 바퀴가 실제로 멈춘다는 보장이 없다는 게 그날 드러났다
+# (grippers-host-mac 사고 보고 참고 — mission_orchestrator의 base.stop()과
+# 이 워치독 둘 다 몇 분 내내 예외 없이 성공했는데 실측(사용자 육안)으로는
+# 계속 돌고 있었다). 이 SDK엔 바퀴 회전 자체를 STM32가 되읽어 오는 프로토콜이
+# 없다(모터 패킷은 buf_write() 전용, parsers 맵에 모터/엔코더 리포트 타입이
+# 없다) — 그래서 "명령이 실제로 먹혔다"를 폐루프로 확인할 방법이 원천적으로
+# 없다.
+#
+# 다만 IMU(자이로)는 진짜 실측이다 — 명령이 아니라 물리적으로 로봇이 얼마나
+# 회전하고 있는지를 STM32가 직접 재서 보고한다(packet_report_imu). 그래서
+# "정지 명령이 계속 나가는데 자이로 z축 각속도가 여전히 크다"는, 이 SDK가
+# 낼 수 있는 유일한 진짜 폐루프 신호다 — 선속도(전진/후진)까지는 못 잡지만
+# (가속도계 적분은 드리프트가 커서 신뢰 못 함), 2026-09-07 사고가 정확히
+# 회전 루프였다는 걸 감안하면 이것만으로도 실질적 개선이다.
+#
+# ⚠️ 아래 값 전부 실기로 튜닝된 적이 없다 — 정지 상태에서 이 로봇의 자이오
+# 노이즈 바닥이 실제로 얼마인지 모른다. 이 임계값(0.15 rad/s ≈ 8.6도/s)은
+# 이번 세션 로그의 회전 명령 크기(az 최대 0.5 rad/s, mecanum 기본 각속도
+# 상한)의 30% 수준으로 잡은 추정치일 뿐이다 — 실기에서 정지 상태 자이로
+# 값을 몇 초 재서 이 값보다 확실히 위에 있는지 먼저 확인하고 조정할 것.
+ROTATION_STALL_GZ_THRESHOLD_RAD_S = 0.15
+# 이 시간보다 최근 IMU 리포트가 없으면(자이로 스트림 자체가 죽은 상태 —
+# recv_task가 별도로 재연결을 시도한다) 판단을 보류한다 — "모른다"를
+# "괜찮다"로 오판하지 않되, 이 판정 자체가 오탐(false alarm)의 원인이
+# 되지는 않는다.
+ROTATION_STALL_IMU_STALE_S = 1.0
+# 워치독이 이만큼 연속으로 0속도를 재전송했는데도(=idle_s가 이 값을 넘었는데도)
+# 여전히 회전 중이면 경보한다 — 워치독이 막 발동한 첫 순간(관성으로 아직
+# 덜 멈췄을 수 있는 찰나)까지 오탐하지 않게 여유를 둔다.
+ROTATION_STALL_MIN_IDLE_S = 1.0
+
+
+def rotation_stall_detected(gz, gz_at, idle_s, now,
+                           gz_threshold_rad_s=ROTATION_STALL_GZ_THRESHOLD_RAD_S,
+                           stale_after_s=ROTATION_STALL_IMU_STALE_S,
+                           min_idle_s=ROTATION_STALL_MIN_IDLE_S):
+    """정지 명령이 idle_s 동안 계속 나가고 있는데(모터 워치독이 반복
+    재전송 중), 최근(stale_after_s 이내) 수신한 자이로 z축 각속도(gz,
+    rad/s)가 gz_threshold_rad_s를 넘으면 True — "정지 명령을 보냈지만
+    실제로는 안 먹혔다"는 실측 근거다.
+
+    순수 함수다 — Board(하드웨어/pyserial)와 분리해 하드웨어 없이 검증한다
+    (tests/test_stm32_motor_watchdog.py의 _FakePort 패턴과 같은 이유,
+    파일 상단 ROTATION_STALL_* 주석 참고)."""
+    if gz is None or gz_at is None:
+        return False
+    if now - gz_at > stale_after_s:
+        return False
+    if idle_s < min_idle_s:
+        return False
+    return abs(gz) > gz_threshold_rad_s
+
+
 class Board:
     buttons_map = {
             'GAMEPAD_BUTTON_MASK_L2':        0x0001,
@@ -173,6 +227,14 @@ class Board:
         self._motor_watchdog_poll = motor_watchdog_poll
         self._last_motor_cmd_at = time.monotonic()
 
+        # 회전 정지 확인용 IMU 캐시(2026-09-07 후속, 파일 상단 ROTATION_STALL_*
+        # 주석 참고) — get_imu()의 소비형 큐(imu_queue)와 별개다. pub_imu_data가
+        # 그 큐를 계속 비우고 있어서, 워치독이 같은 큐를 또 소비하면 서로
+        # 데이터를 나눠 갖게 된다 — 여기는 "엿보기 전용" 캐시라 누구와도 안
+        # 겹친다.
+        self._last_imu_gz = None
+        self._last_imu_at = None
+
         time.sleep(0.5)
         threading.Thread(target=self.recv_task, daemon=True).start()
         threading.Thread(target=self._motor_watchdog_task, daemon=True).start()
@@ -195,6 +257,15 @@ class Board:
             self.imu_queue.put_nowait(data)
         except queue.Full:
             pass
+        # 회전 정지 확인용 엿보기 캐시 갱신(위 __init__ 주석 참고) — 큐 소비와
+        # 무관하게 recv_task가 새 IMU 패킷을 파싱할 때마다 항상 갱신된다.
+        try:
+            _, _, _, _, _, gz = struct.unpack('<6f', data)
+        except struct.error:
+            pass
+        else:
+            self._last_imu_gz = gz
+            self._last_imu_at = time.monotonic()
 
     def packet_report_gamepad(self, data):
         try:
@@ -450,6 +521,7 @@ class Board:
         확인하고, 여전히 멈춰 있으면 또 0속도를 재전송"하는 모양이 된다.
         정상 동작 중(위 어딘가가 계속 새 명령을 주는 동안)에는 이 분기에
         아예 들어오지 않는다."""
+        _rotation_stall_alerted = False
         while True:
             time.sleep(self._motor_watchdog_poll)
             idle_s = time.monotonic() - self._last_motor_cmd_at
@@ -464,6 +536,31 @@ class Board:
                 print(f"[{time.time():.3f}] [motor_watchdog] {idle_s:.2f}초 동안 "
                       f"새 모터 명령이 없습니다 — 0속도를 강제 전송합니다", flush=True)
                 self.set_motor_speed([[1, 0.0], [2, 0.0], [3, 0.0], [4, 0.0]])
+
+                # 회전 정지 확인(2026-09-07 후속, 파일 상단 ROTATION_STALL_*
+                # 주석 참고) — 방금 재전송이 "성공"했다는 사실 자체는 아무것도
+                # 증명하지 않는다(2026-09-07 사고가 정확히 그랬다). 자이로로
+                # 실측을 확인한다.
+                # 모듈 전역 상수를 매번 다시 읽어서 넘긴다(함수 기본값에
+                # 의존하지 않는다) — 테스트가 이 전역을 monkeypatch해서
+                # 1초 단위 실기 튜닝값을 실제로 기다리지 않고 빠르게 검증할
+                # 수 있게 하기 위해서다.
+                if rotation_stall_detected(
+                        self._last_imu_gz, self._last_imu_at, idle_s, time.monotonic(),
+                        gz_threshold_rad_s=ROTATION_STALL_GZ_THRESHOLD_RAD_S,
+                        stale_after_s=ROTATION_STALL_IMU_STALE_S,
+                        min_idle_s=ROTATION_STALL_MIN_IDLE_S):
+                    if not _rotation_stall_alerted:
+                        print("\a\a\a", end="", flush=True)
+                        print("=" * 60, flush=True)
+                        print(f"[{time.time():.3f}] [motor_watchdog][경고] 0속도를 "
+                              f"{idle_s:.1f}초째 재전송 중인데 자이로 gz="
+                              f"{self._last_imu_gz:+.3f} rad/s — 명령이 안 먹혔을 "
+                              "수 있습니다. 로봇을 직접 확인하세요", flush=True)
+                        print("=" * 60, flush=True)
+                        _rotation_stall_alerted = True
+                else:
+                    _rotation_stall_alerted = False
     
     '''
     def set_rgb(self, pixels):

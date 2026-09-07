@@ -208,3 +208,126 @@ def test_재연결_후_다음_쓰기는_다시_성공한다(fake_port):
     board.set_led(0.1, 0.1, 1, 1)   # 2번째 — 재연결된 같은 포트로 다시 성공해야 한다
 
     assert len(port.writes) == 1, "재연결 뒤 정상 쓰기가 기록되지 않았다 — 여전히 막혀 있다"
+
+
+# ---------------------------------------------------------------------------
+# 회전 정지 확인 (2026-09-07 실기 사고 후속) — 모듈 docstring/
+# ros_robot_controller_sdk.py 상단 ROTATION_STALL_* 주석 참고.
+#
+# 2026-09-07 실기: 정지 명령(mission_orchestrator의 base.stop(), 이
+# 모듈의 모터 워치독 둘 다)이 몇 분 내내 예외 없이 계속 "성공"했는데도
+# 바퀴는 실제로 멈추지 않았다. 이 SDK엔 바퀴 회전을 STM32가 되읽어오는
+# 프로토콜이 아예 없어서(모터는 buf_write 전용, parsers 맵에 엔코더/속도
+# 리포트가 없다) 그 자체로는 폐루프 확인이 불가능하다 — 대신 이미 오는
+# IMU 자이로(진짜 실측)로 "정지 명령은 계속 나가는데 실제로는 여전히
+# 돌고 있다"를 감지한다.
+# ---------------------------------------------------------------------------
+
+def _now():
+    return time.monotonic()
+
+
+def test_회전정지_판정_자이로가_크면_감지한다():
+    now = _now()
+    assert sdk.rotation_stall_detected(
+        gz=0.30, gz_at=now - 0.1, idle_s=1.5, now=now,
+        gz_threshold_rad_s=0.15, stale_after_s=1.0, min_idle_s=1.0)
+
+
+def test_회전정지_판정_자이로가_작으면_감지_안한다():
+    now = _now()
+    assert not sdk.rotation_stall_detected(
+        gz=0.05, gz_at=now - 0.1, idle_s=1.5, now=now,
+        gz_threshold_rad_s=0.15, stale_after_s=1.0, min_idle_s=1.0)
+
+
+def test_회전정지_판정_idle이_아직_짧으면_보류한다():
+    """워치독이 막 발동한 찰나(관성으로 아직 덜 멈췄을 수 있다)는 오탐하지
+    않는다."""
+    now = _now()
+    assert not sdk.rotation_stall_detected(
+        gz=0.30, gz_at=now - 0.1, idle_s=0.5, now=now,
+        gz_threshold_rad_s=0.15, stale_after_s=1.0, min_idle_s=1.0)
+
+
+def test_회전정지_판정_자이로_값이_오래됐으면_보류한다():
+    """IMU 스트림 자체가 죽은 상태(recv_task가 별도로 재연결을 시도하는
+    상황)면 "모른다"를 "괜찮다"로 오판하지 않되, 이 판정이 오탐을 내지도
+    않는다 — 자이로 자체가 안 죽었는데 값만 우연히 옛날 것인 경우와
+    실제 스트림 정지를 구분할 방법이 이 함수 수준에는 없어서, 안전한
+    쪽(경보 안 함)을 택한다."""
+    now = _now()
+    assert not sdk.rotation_stall_detected(
+        gz=0.30, gz_at=now - 5.0, idle_s=1.5, now=now,
+        gz_threshold_rad_s=0.15, stale_after_s=1.0, min_idle_s=1.0)
+
+
+def test_회전정지_판정_자이로_값이_아직_없으면_보류한다():
+    now = _now()
+    assert not sdk.rotation_stall_detected(
+        gz=None, gz_at=None, idle_s=1.5, now=now,
+        gz_threshold_rad_s=0.15, stale_after_s=1.0, min_idle_s=1.0)
+
+
+def test_imu_수신시_엿보기_캐시가_갱신된다(fake_port):
+    """packet_report_imu가 소비형 큐(get_imu())와 별개로, 워치독이 읽는
+    엿보기 캐시(_last_imu_gz/_last_imu_at)도 갱신하는지 확인한다 — 두
+    소비자가 같은 큐를 다투면 데이터를 나눠 갖게 되므로 별도 캐시가
+    필요하다(파일 상단 주석 참고)."""
+    board = sdk.Board(motor_watchdog_timeout=100.0)
+    assert board._last_imu_gz is None
+
+    gz_value = 0.42
+    data = struct.pack('<6f', 0.0, 0.0, 9.8, 0.0, 0.0, gz_value)
+    board.packet_report_imu(data)
+
+    assert board._last_imu_gz == pytest.approx(gz_value)
+    assert board._last_imu_at is not None
+
+    # get_imu()로 큐를 소비해도 엿보기 캐시는 그대로 남아 있어야 한다 —
+    # 워치독과 pub_imu_data가 서로 안 다퉈야 한다는 게 이 캐시의 요점이다.
+    board.get_imu()
+    assert board._last_imu_gz == pytest.approx(gz_value)
+
+
+def test_회전중_워치독_재전송에도_계속_돌면_경보하고_멈추면_그친다(fake_port, capsys, monkeypatch):
+    """통합 시험 — 실제로 모터 워치독 스레드가 자이로 값을 보고 경보
+    문구를 찍는지, 그리고 자이로가 실제로 잠잠해지면 경보가 그치는지
+    확인한다. 1초 단위 실기 튜닝값(ROTATION_STALL_MIN_IDLE_S 등)을 실제로
+    기다리면 시험이 느려지므로, 모듈 전역을 짧게 monkeypatch한다 —
+    _motor_watchdog_task가 이 전역을 매번 다시 읽어서 넘기도록 짜여 있어
+    반영된다(ros_robot_controller_sdk.py의 rotation_stall_detected
+    호출부 주석 참고).
+
+    ⚠️ 두 상황(계속 돎 / 멈춤)을 별개 테스트 대신 **같은 board 하나로
+    이어서** 확인한다 — Board()에는 워치독 데몬 스레드를 깨끗이 멈추는
+    방법이 없어서, 테스트마다 새 Board()를 만들면 이전 테스트의 워치독
+    스레드가 안 죽고 계속 돌며 다음 테스트의 capsys 캡처 구간에 자기
+    출력을 섞어 넣는다(처음엔 이 파일도 그렇게 짰다가, "멈추면 경보 안
+    함" 테스트가 직전 테스트의 board가 낸 경보 잔재 때문에 거짓 실패하는
+    걸 보고 이 형태로 고쳤다) — 같은 board를 재사용하면 그 board의
+    이력만 보게 되고, readouterr()로 버퍼를 매번 비우면 이전 구간의
+    출력이 다음 assert에 안 섞인다."""
+    monkeypatch.setattr(sdk, "ROTATION_STALL_MIN_IDLE_S", 0.03)
+    monkeypatch.setattr(sdk, "ROTATION_STALL_IMU_STALE_S", 1.0)
+    monkeypatch.setattr(sdk, "ROTATION_STALL_GZ_THRESHOLD_RAD_S", 0.15)
+
+    board = sdk.Board(motor_watchdog_timeout=0.02, motor_watchdog_poll=0.01)
+
+    # 1) 자이로가 계속 큰 값을 보고하는 상황을 흉내낸다 — 정지 명령
+    # (워치독의 반복 재전송)에도 불구하고 실측 회전이 여전히 크다.
+    data = struct.pack('<6f', 0.0, 0.0, 9.8, 0.0, 0.0, 0.40)
+    board.packet_report_imu(data)
+    time.sleep(0.25)   # min_idle_s(0.03) + 워치독이 몇 사이클 더 돌 여유
+
+    out = capsys.readouterr().out
+    assert "경고" in out and "자이로" in out, (
+        f"자이로가 계속 크게 나오는데도 경보가 안 찍혔다 — 회귀. 출력: {out!r}")
+
+    # 2) 이제 자이로가 실제로 정지 상태 노이즈 수준으로 잠잠해진다.
+    data = struct.pack('<6f', 0.0, 0.0, 9.8, 0.0, 0.0, 0.02)
+    board.packet_report_imu(data)
+    time.sleep(0.25)
+
+    out = capsys.readouterr().out
+    assert "경고" not in out, f"실제로 멈췄는데 경보가 찍혔다 — 오탐. 출력: {out!r}"

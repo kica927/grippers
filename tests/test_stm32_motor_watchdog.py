@@ -262,6 +262,41 @@ def test_회전정지_판정_자이로_값이_오래됐으면_보류한다():
         gz_threshold_rad_s=0.15, stale_after_s=1.0, min_idle_s=1.0)
 
 
+def test_모터_쓰기가_실패하면_워치독_타임스탬프를_안_갱신한다(fake_port):
+    """2026-09-07 2차 회전정지 사고 코드 리뷰 후속 — set_motor_speed()가
+    buf_write() 성공 여부와 무관하게 _last_motor_cmd_at을 무조건 찍고
+    있었다. 그러면 쓰기가 실제로 실패해도 워치독은 "방금 명령이 나갔다"고
+    오판해 idle_s가 안 쌓이고, 다음 판정 주기까지 재시도조차 안 걸린다 —
+    실제 사고 원인이라는 증거는 없었지만(로그에 쓰기 예외 자체가 없었다),
+    워치독이 "성공"을 잘못 정의하고 있던 것 자체는 결함이다. 쓰기가
+    성공했을 때만 타임스탬프를 갱신해야 한다."""
+    board = sdk.Board(motor_watchdog_timeout=100.0)
+    port = fake_port[0]
+
+    before = board._last_motor_cmd_at
+
+    def _raise(_buf):
+        raise sdk.serial.SerialTimeoutException("write timeout")
+    port.write = _raise
+
+    board.set_motor_speed([[1, 0.3], [2, 0.3], [3, 0.3], [4, 0.3]])
+
+    assert board._last_motor_cmd_at == before, (
+        "쓰기가 실패했는데도 타임스탬프가 갱신됐다 — 워치독이 이 실패를 못 본다")
+
+
+def test_모터_쓰기가_성공하면_워치독_타임스탬프를_갱신한다(fake_port):
+    """위 시험의 반대쪽 — 정상 동작(쓰기 성공)까지 갱신을 막아버리면 안
+    된다는 걸 같이 고정해 둔다."""
+    board = sdk.Board(motor_watchdog_timeout=100.0)
+
+    before = board._last_motor_cmd_at
+    time.sleep(0.01)
+    board.set_motor_speed([[1, 0.3], [2, 0.3], [3, 0.3], [4, 0.3]])
+
+    assert board._last_motor_cmd_at > before
+
+
 def test_회전정지_판정_자이로_값이_아직_없으면_보류한다():
     now = _now()
     assert not sdk.rotation_stall_detected(

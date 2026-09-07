@@ -487,7 +487,14 @@ class Board:
                 except Exception as reopen_err:
                     print(f"[buf_write] 포트 재연결 실패({reopen_err}) — 다음 쓰기에서 다시 시도",
                           flush=True)
+            # 2026-09-07, 2차 회전정지 사고 리뷰 후속 — 호출자(특히
+            # set_motor_speed())가 "이번 쓰기가 실제로 나갔는지"를 알아야
+            # 워치독의 _last_motor_cmd_at을 성공했을 때만 갱신할 수 있다.
+            # 그동안은 여기서 예외를 삼키고 로그만 남긴 채 반환값이 없어서,
+            # 실패해도 호출자는 "성공"과 구분할 방법이 없었다.
+            return False
         #print(buf)
+        return True
 
 
     def set_led(self, on_time, off_time, repeat=1, led_id=1):
@@ -502,14 +509,23 @@ class Board:
 
     def set_motor_speed(self, speeds):
         # 2026-09-05 — 모터 워치독(__init__의 _motor_watchdog_task 참고)이
-        # "마지막으로 이 메서드가 불린 시각"을 본다. 워치독 자신의 0속도
+        # "마지막으로 이 메서드가 성공한 시각"을 본다. 워치독 자신의 0속도
         # 재전송도 이 메서드를 그대로 타므로, 정상 명령이든 워치독의 강제
         # 정지든 여기 한 곳만 갱신하면 된다.
-        self._last_motor_cmd_at = time.monotonic()
+        #
+        # 2026-09-07, 2차 회전정지 사고 코드 리뷰 후속 — 예전엔 buf_write()
+        # 결과와 무관하게 타임스탬프를 무조건 찍었다. 그러면 쓰기가 실제로
+        # 실패해도(포트 write_timeout 등) 워치독은 "방금 명령이 나갔다"고
+        # 오판해 idle_s가 안 쌓이고, 다음 워치독 판정 주기까지 재시도조차
+        # 안 걸렸다 — 이번 두 차례 "정지 명령은 성공하는데 안 멈춘" 사고의
+        # 직접 원인이라는 증거는 없었지만(로그에 쓰기 예외 자체가 없었다),
+        # 워치독이 "성공"을 잘못 정의하고 있던 것 자체는 실제 결함이라
+        # 고쳐 둔다. buf_write()가 성공(True)했을 때만 갱신한다.
         data = [0x01, len(speeds)]
         for i in speeds:
             data.extend(struct.pack("<Bf", int(i[0] - 1), float(i[1])))
-        self.buf_write(PacketFunction.PACKET_FUNC_MOTOR, data)
+        if self.buf_write(PacketFunction.PACKET_FUNC_MOTOR, data):
+            self._last_motor_cmd_at = time.monotonic()
 
     def _motor_watchdog_task(self):
         """set_motor_speed()가 _motor_watchdog_timeout 동안 한 번도 안

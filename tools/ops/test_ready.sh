@@ -21,10 +21,18 @@ echo "=== 1/3 코드 상태 확인 ==="
 cd "$REPO"
 git fetch --all --quiet
 git status -sb
-BEHIND=$(git rev-list --count HEAD..origin/kica927/baseline_mission 2>/dev/null || echo 0)
+# 2026-09-07: origin(grippers-intel 팀 저장소) 대비로 비교하던 것을
+# personal-mirror(kica927/grippers)로 고쳤다. 이 프로젝트 규칙(메모리
+# grippers-git-sync-personal-mirror-source)이 "항상 personal-mirror에서
+# 동기화, origin은 절대 안 씀"인데 이 줄만 origin 기준이라 어긋나 있었다.
+# 그 결과 personal-mirror에만 push된 커밋(배터리 부저 문턱 7200mV 변경,
+# 10390e8)이 origin엔 없어 "이미 최신입니다"로 잘못 보고됐고, Pi가 실제로는
+# 1커밋 뒤처진 채(구버전 7800mV 문턱) 계속 돌았다 — 실기에서 부저가 새
+# 문턱보다 훨씬 위(7798mV)에서 울려서 발견됐다.
+BEHIND=$(git rev-list --count HEAD..personal-mirror/kica927/baseline_mission 2>/dev/null || echo 0)
 if [ "$BEHIND" != "0" ]; then
   echo "원격이 $BEHIND 커밋 앞서 있습니다 — ff-only 로 받습니다."
-  git merge --ff-only origin/kica927/baseline_mission
+  git merge --ff-only personal-mirror/kica927/baseline_mission
   git log --oneline -3
 else
   echo "이미 최신입니다."

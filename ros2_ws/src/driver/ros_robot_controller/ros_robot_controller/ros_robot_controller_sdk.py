@@ -379,11 +379,43 @@ class Board:
         # TTY 아님). 파이썬 stdout은 TTY가 아니면 기본이 완전 버퍼링이라,
         # flush 없이는 이 줄이 버퍼에 갇혀 있다가 프로세스가 비정상 종료되면
         # (정확히 이 print가 알리려는 그 상황) 로그에 영영 안 남을 수 있다.
+        #
+        # 2026-09-06 — 그동안 이 except는 로그만 남기고 끝났다. 그런데
+        # recv_task(읽기 스레드, __init__의 _port_lock 주석 참고)는 예외가
+        # 나면 포트를 close()→sleep(0.5)→open()으로 스스로 재연결한다 — 쓰기
+        # 쪽엔 이 회복이 없었다. write_timeout이 실제로 걸리는 원인이 그
+        # 순간의 일시적 지연이 아니라 포트 자체가 막힌 상태(USB 버스 정체
+        # 등)라면, 다음 buf_write() 호출도 계속 같은 이유로 조용히 실패한다
+        # — 모터 워치독(_motor_watchdog_task)의 강제 0속도 재전송조차 결국
+        # 이 메서드를 타므로, 포트가 이 상태에 빠지면 워치독마저 "0.5초마다
+        # 다시 시도하지만 매번 조용히 실패"하는 채로 멈춘다. "모터에 명령은
+        # 가는데 바퀴만 안 움직이고, 유일한 해결책이 노드 재기동(=Board()를
+        # 새로 만들어 포트를 다시 여는 것)뿐이었다"는 반복 신고와 이 모양이
+        # 정확히 들어맞는다(사용자 보고, 실기 재현 빈도 약 1/20 — 이 재연결
+        # 자체는 아직 실기로 검증되지 않았다).
+        #
+        # recv_task와 같은 회복을 여기서도 시도한다. 이 시도 자체가
+        # 실패해도(장치가 정말 빠졌다면) 다음 buf_write() 호출에서 또
+        # 시도하므로 무한정 막힌 채로 남지 않는다. 이번 명령 자체는 여전히
+        # 유실이다 — 재시도로 여기서 곧장 다시 보내면 재귀/폭주 위험이 있어
+        # 그렇게 하지 않는다.
         try:
             with self._port_lock:
                 self.port.write(buf)
         except Exception as e:
-            print(f"[buf_write] 시리얼 쓰기 실패({e}) — 이 명령은 유실됨", flush=True)
+            print(f"[buf_write] 시리얼 쓰기 실패({e}) — 이 명령은 유실됨, 포트 재연결 시도",
+                  flush=True)
+            with self._port_lock:
+                try:
+                    self.port.close()
+                except Exception:
+                    pass
+                time.sleep(0.5)
+                try:
+                    self.port.open()
+                except Exception as reopen_err:
+                    print(f"[buf_write] 포트 재연결 실패({reopen_err}) — 다음 쓰기에서 다시 시도",
+                          flush=True)
         #print(buf)
 
 

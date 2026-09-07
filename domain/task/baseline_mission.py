@@ -707,34 +707,20 @@ class BaselineCarryState(State):
         if command.state == MissionState.INSERT:
             return self._judge_insert(ports, command, face)
 
-        if command.state == MissionState.APPROACH_BOX and face.ok:
-            # 09-02 실기(2건): NUDGE_BOX가 Host 계획 거리(want_m)를 다 밀
-            # 때까지 라이다를 안 보다가, PLACE에 들어가서야 확인해서는 늦었다
-            # — ArUco 데드레커닝이 틀리면 그사이 이미 바구니에 닿는다. 접근
-            # 중에도 매 사이클 확인해서, 이미 너무 가까우면 Host 계획을
-            # 무시하고 더 밀지 않는다(바퀴를 실제로 돌리는 쪽이 최종
-            # 안전판이라는 이 파일의 기존 원칙 그대로 — encode()/motion.py의
-            # 속도 클램프와 같은 계층).
-            too_close = corrections.retreat_if_too_close(face.distance_m)
-            if too_close is not None:
-                ports.base.stop()
-                ports.host.report(
-                    Report.INSERT_BLOCKED, self.reported_as,
-                    f"라이다 판독이 하한보다 가깝다 ({face.distance_m:.3f}m < "
-                    f"{bc.BASKET_MIN_LIDAR_M:.3f}m) — 접근 중 감지, 더 밀지 않는다",
-                    too_close)
-                return BaselineCarryState(self.label, self.reported_as, self.sample,
-                                          self.grasp_confirmed)
-            if corrections.within_stop_window(face.distance_m):
-                # 이미 알맞은 거리다 — 계획한 거리를 마저 채우면 창을 넘겨
-                # 버린다. 요·좌우·안정성·부하는 아직 안 본다 — PLACE에서
-                # check_insert가 평소대로 마저 본다.
-                ports.base.stop()
-                ports.host.report(
-                    Report.APPROACH_BOX_READY, self.reported_as,
-                    f"라이다 {face.distance_m:.3f}m — 목표창 안, 그만 밀어도 된다")
-                return BaselineCarryState(self.label, self.reported_as, self.sample,
-                                          self.grasp_confirmed)
+        # ⚠️ 2026-09-07, 사용자 지시("라이다로 가까워서 block이 뜬 거잖아...
+        # 라이다는 그냥 다 지워") — 여기 있던 APPROACH_BOX 실시간 라이다
+        # 점검(retreat_if_too_close/within_stop_window)을 없앴다. 09-02
+        # 실기 때는 "ArUco 데드레커닝이 틀리면 이미 바구니에 닿을 수
+        # 있다"는 우려로 넣은 것이었는데, 라이다 하한(BASKET_MIN_LIDAR_M)
+        # 바로 근처에서 판독이 흔들려 실제로는 괜찮은 상황에서도
+        # INSERT_BLOCKED가 계속 뜨는 문제가 실기로 확인됐다(세 번째 기물
+        # INSERT에서 12초 넘게 NUDGE_BOX<->PLACE 왕복). "너무 가까우면
+        # 후진" 판단은 이제 Host가 순수 ArUco 거리(mission.py의
+        # live_too_close, mission_config.BASKET_BACK_TRIGGER_MARGIN_M)로
+        # 대신한다 — Pi는 이 상태에서 더 이상 라이다를 보지 않고 Host가
+        # 보낸 속도(go/back)를 그대로 낸다. PLACE 진입 뒤의 최종 확인은
+        # check_insert가 여전히 맡되, 그쪽도 LIDAR_INSERT_CHECK_ENABLED=
+        # False라 지금은 라이다를 안 본다.
 
         if not _drive(ports, command, self.reported_as):
             return self
@@ -808,12 +794,21 @@ class BaselineCarryState(State):
                               corrections.from_insert(insert_inputs))
             return BaselineCarryState(self.label, self.reported_as, self.sample,
                                       self.grasp_confirmed)
-        ports.host.report(
-            Report.INSERT_READY, self.reported_as,
-            f"라이다 {face.distance_m:.3f}m yaw {face.yaw_error_rad:+.3f}rad "
-            f"점 {face.point_count} 좌우 "
-            + (f"{face.lateral_offset_m * 1000:+.0f}mm"
-               if face.lateral_known else "창 안(중앙)"))
+        # 2026-09-07 — LIDAR_INSERT_CHECK_ENABLED=False면 check_insert()가
+        # 위에서 이미 라이다 항목들을 안 보고 통과시켰다(158번째 줄 조기
+        # 반환). 그런데 이 보고 문구는 그 스위치와 무관하게 항상 face의
+        # 라이다 실측치를 찍고 있었다 — 판정에 안 쓰는 값을 보여주니
+        # "라이다로 판정한다"는 오해를 산다(사용자 지적). 스위치가 켜져
+        # 있을 때만(실제로 그 값들이 판정에 쓰였을 때만) 상세 수치를 보여준다.
+        if bc.LIDAR_INSERT_CHECK_ENABLED:
+            detail = (
+                f"라이다 {face.distance_m:.3f}m yaw {face.yaw_error_rad:+.3f}rad "
+                f"점 {face.point_count} 좌우 "
+                + (f"{face.lateral_offset_m * 1000:+.0f}mm"
+                   if face.lateral_known else "창 안(중앙)"))
+        else:
+            detail = "판정 통과 — 투하 진행 (라이다 판정 꺼짐)"
+        ports.host.report(Report.INSERT_READY, self.reported_as, detail)
         return BaselineInsertState(self.label, self.grasp_confirmed)
 
 

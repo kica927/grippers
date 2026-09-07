@@ -64,7 +64,19 @@ class Ros2Perception(Perception):
                 self._node, self._observe_client,
                 ObserveTarget.Request(raw_cls=label, force_fresh=(index == 0)),
                 label="identify_target")
-            if res is None or not res.found:
+            # 2026-09-06 — GRASP_BLOCKED("뎁스 카메라가 정면에서 목표를 찾지
+            # 못했다")가 실기에서 파지 가능한 상태에도 뜨는 오탐이 관측됐다.
+            # ObserveTarget.srv의 reason 필드(2026-09-01, 정확히 이 진단을
+            # 위해 추가됨)를 그동안 여기서 그냥 버리고 있어서 신뢰도 게이트/
+            # 화면위치 게이트/합의 게이트 중 어디서 막혔는지 알 방법이
+            # 없었다 — 다음 실기에서 원인을 잡을 수 있도록 로그로 남긴다.
+            if res is None:
+                self._node.get_logger().warn(
+                    f"[identify_target] {label}: 서비스 응답 없음(res=None)")
+                continue
+            if not res.found:
+                self._node.get_logger().warn(
+                    f"[identify_target] {label}: not found — {res.reason}")
                 continue
             area = float(res.h) * float(res.w)
             if area > best_area:

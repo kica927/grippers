@@ -220,16 +220,24 @@ def test_CARRY_중에도_IDLE_명령을_받으면_IdleState로_돌아간다():
     assert isinstance(nxt, BaselineIdleState)
 
 
-# ── APPROACH_BOX 접근 중 실시간 라이다 점검 (2026-09-02) ───────────────────
+# ── APPROACH_BOX 접근 중 실시간 라이다 점검 (2026-09-02, 2026-09-07 제거) ──
 #
 # NUDGE_BOX가 Host 계획 거리(want_m)를 다 밀 때까지 라이다를 안 보고 있다가
-# PLACE에서야 확인해서 늦었던 사고(09-02 실기 2건)의 재발 방지. 접근 중에도
-# 매 사이클 확인해서 너무 가까우면 더 밀지 않고, 이미 알맞으면 그만 민다.
+# PLACE에서야 확인해서 늦었던 사고(09-02 실기 2건)의 재발 방지로 도입했었다.
+# 그런데 라이다 하한(BASKET_MIN_LIDAR_M) 바로 근처에서 판독이 흔들려,
+# 실제로는 괜찮은 상황에서도 INSERT_BLOCKED가 계속 뜨는 문제가 실기로
+# 확인됐다(2026-09-07, 세 번째 기물 INSERT에서 12초 넘게 NUDGE_BOX<->PLACE
+# 왕복 — 사용자: "라이다로 가까워서 block이 뜬 거잖아... 라이다는 그냥 다
+# 지워"). "너무 가까우면 후진" 판단은 이제 Host가 순수 ArUco 거리로 대신
+# 한다(host/mission.py의 live_too_close, BASKET_BACK_TRIGGER_MARGIN_M) —
+# Pi는 이 상태에서 라이다를 더 이상 보지 않고 Host가 보낸 속도를 그대로
+# 낸다. 아래는 그 회귀 확인이다.
 
 
-def test_접근_중_라이다가_하한보다_가까우면_더_밀지_않는다():
-    """Host가 계속 go를 보내도, 이미 너무 가까우면 Pi가 그 명령을 무시하고
-    정지한다 — 바퀴를 실제로 돌리는 쪽이 최종 안전판이다."""
+def test_접근_중_라이다가_가까워도_Host_명령을_그대로_낸다():
+    """2026-09-07 — 예전에는 여기서 Pi가 스스로 멈췄다. 이제 "너무 가까운가"
+    판단은 Host 몫이라, Pi는 라이다 값과 무관하게 Host가 보낸 속도를 그대로
+    낸다."""
     too_close_face = _good_face(bc.BASKET_MIN_LIDAR_M - 0.01)
     base = FakeBase()
     host = FakeHostLink([HostCommand(MissionState.APPROACH_BOX, linear_x=0.1)])
@@ -237,26 +245,14 @@ def test_접근_중_라이다가_하한보다_가까우면_더_밀지_않는다(
 
     BaselineCarryState("queen", MissionState.APPROACH_BOX).execute(ports)
 
-    assert base.velocity_calls == [], "이미 너무 가까운데 계속 밀었다"
-    assert base.stop_calls >= 1
-    assert Report.INSERT_BLOCKED in host.reported_kinds
+    assert base.velocity_calls, "라이다가 가깝다고 Pi가 스스로 멈췄다"
+    assert Report.INSERT_BLOCKED not in host.reported_kinds
+    assert Report.APPROACH_BOX_READY not in host.reported_kinds
 
 
-def test_접근_중_너무_가까우면_물러나는_보정을_같이_보낸다():
-    too_close_face = _good_face(bc.BASKET_MIN_LIDAR_M - 0.01)
-    host = FakeHostLink([HostCommand(MissionState.APPROACH_BOX, linear_x=0.1)])
-    ports = _ports(host=host, lidar=FakeLidar([too_close_face]))
-
-    BaselineCarryState("queen", MissionState.APPROACH_BOX).execute(ports)
-
-    fixes = host.reported_fixes
-    assert fixes, "보정 없이 막기만 하면 Host가 고칠 방법을 모른다"
-    report, fix = fixes[0]
-    assert report == Report.INSERT_BLOCKED
-    assert fix.action == "retreat"
-
-
-def test_접근_중_이미_목표창_안이면_그만_밀고_알린다():
+def test_접근_중_목표창_안이어도_계획한_거리를_그대로_민다():
+    """2026-09-07 — 예전에는 여기서 Pi가 "이미 알맞다"고 스스로 멈췄다.
+    이제 그 판단도 Host 몫이다(Host가 알맞다고 보면애초에 go를 안 보낸다)."""
     good_face = _good_face(bc.BASKET_STOP_LIDAR_M)
     base = FakeBase()
     host = FakeHostLink([HostCommand(MissionState.APPROACH_BOX, linear_x=0.1)])
@@ -264,9 +260,8 @@ def test_접근_중_이미_목표창_안이면_그만_밀고_알린다():
 
     BaselineCarryState("queen", MissionState.APPROACH_BOX).execute(ports)
 
-    assert base.velocity_calls == [], "이미 목표창 안인데 계획한 거리를 마저 밀었다"
-    assert base.stop_calls >= 1
-    assert Report.APPROACH_BOX_READY in host.reported_kinds
+    assert base.velocity_calls, "목표창 안이라고 Pi가 스스로 멈췄다"
+    assert Report.APPROACH_BOX_READY not in host.reported_kinds
 
 
 def test_접근_중_창_밖이면_평소대로_계속_민다():

@@ -21,6 +21,18 @@
 `Board`는 순수 pyserial 의존일 뿐 rclpy가 필요 없어서(모듈 상단 import
 참고), 이 저장소의 다른 domain 테스트와 같은 방식으로 하드웨어·ROS2 없이
 검증한다 — 진짜 시리얼 포트 대신 `_FakePort`로 대체한다.
+
+## 2026-09-06 추가 — buf_write()의 재연결
+
+위 둘만으로는 "모터 명령은 가는데 바퀴만 안 움직이고, 유일한 해결책이
+재기동"이던 반복 신고를 다 못 막는다는 게 이날 드러났다. `recv_task`
+(읽기 스레드)는 예외가 나면 포트를 `close()`→`open()`으로 스스로 재연결
+하는데, `buf_write()`(쓰기 경로 — 모터 워치독의 강제 0속도 재전송도 결국
+이걸 탄다)는 그동안 예외를 잡아 로그만 남기고 포트는 그대로 뒀다. 포트가
+일시적 지연이 아니라 실제로 막힌 상태라면, 그 뒤 모든 쓰기(워치독의 재시도
+포함)가 계속 같은 이유로 조용히 실패할 수 있었다 — 아래 두 시험은 `buf_
+write()`도 `recv_task`와 같은 재연결을 시도하는지, 그리고 재연결 뒤엔
+실제로 다시 쓰기가 되는지를 검증한다.
 """
 
 from __future__ import annotations
@@ -54,15 +66,22 @@ class _FakePort:
         self.dtr = None
         self._device = None
         self.opened = False
+        # 2026-09-06 — buf_write()의 재연결 시험용. Board.__init__()이 이미
+        # open()을 한 번 호출하므로, 재연결이 실제로 일어났는지 보려면
+        # "그 뒤로 몇 번 더" 불렸는지가 필요하다.
+        self.open_count = 0
+        self.close_count = 0
 
     def setPort(self, device):
         self._device = device
 
     def open(self):
         self.opened = True
+        self.open_count += 1
 
     def close(self):
         self.opened = False
+        self.close_count += 1
 
     def write(self, buf):
         self.writes.append(bytes(buf))
@@ -146,3 +165,46 @@ def test_계속_새_명령이_오면_워치독이_안_끼어든다(fake_port):
     # 내가 보낸 것 이상으로 워치독이 추가로 끼어들어 쏘지 않았어야 한다 —
     # 끼어들었다면 워치독이 healthy 상태에서도 오발동한다는 뜻이다.
     assert len(port.writes) == sent
+
+
+def test_쓰기가_계속_실패하면_buf_write가_포트를_재연결한다(fake_port):
+    """2026-09-06 — recv_task는 예외가 나면 포트를 스스로 재연결하는데
+    buf_write는 그동안 로그만 남기고 포트를 안 건드렸다. "모터 명령은
+    가는데 바퀴만 안 움직이고 유일한 해결책이 재기동이었다"는 반복 신고의
+    유력 원인이라, buf_write도 같은 재연결(close→open)을 시도하는지
+    확인한다."""
+    board = sdk.Board(motor_watchdog_timeout=100.0)
+    port = fake_port[0]
+    port.open_count = 0   # Board.__init__() 안의 최초 open()은 이 시험의 관심사가 아니다
+
+    def _raise(_buf):
+        raise sdk.serial.SerialTimeoutException("write timeout")
+    port.write = _raise
+
+    board.set_led(0.1, 0.1, 1, 1)   # 실패 -> 재연결을 시도해야 한다
+
+    assert port.close_count == 1, "실패한 쓰기 뒤 포트를 닫지 않았다 — recv_task와 다른 동작"
+    assert port.open_count == 1, "닫은 뒤 다시 열지 않았다 — 포트가 막힌 채로 남는다"
+
+
+def test_재연결_후_다음_쓰기는_다시_성공한다(fake_port):
+    """재연결 자체가 다음 명령까지 계속 막아서는 안 된다 — 재연결 이후에
+    오는 정상 쓰기(모터 워치독의 다음 재전송 포함)는 다시 성공해야
+    한다(2026-09-06)."""
+    board = sdk.Board(motor_watchdog_timeout=100.0)
+    port = fake_port[0]
+
+    calls = {"n": 0}
+    _orig_writes = port.writes
+
+    def _fail_once_then_record(buf):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sdk.serial.SerialTimeoutException("write timeout")
+        _orig_writes.append(bytes(buf))
+    port.write = _fail_once_then_record
+
+    board.set_led(0.1, 0.1, 1, 1)   # 1번째 — 실패하고 재연결됨
+    board.set_led(0.1, 0.1, 1, 1)   # 2번째 — 재연결된 같은 포트로 다시 성공해야 한다
+
+    assert len(port.writes) == 1, "재연결 뒤 정상 쓰기가 기록되지 않았다 — 여전히 막혀 있다"

@@ -44,3 +44,32 @@ def object_class_for_hailo_id(class_id: int) -> str | None:
         return None
     class_name = HAILO_CLASS_NAMES[class_id]
     return HAILO_CLASS_TO_OBJECT_CLASS.get(class_name)
+
+
+def hailo_bbox_to_frame_xyxy(det, canvas_size, orig_h, orig_w):
+    """Hailo 검출 한 건을 `perception_node._letterbox` 캔버스 좌표계
+    (0~1 정규화, 순서 `[y_min, x_min, y_max, x_max, score]` —
+    tools/hailo/live_yolo_demo.py의 draw_detections와 동일 관례)에서
+    **원본 프레임의 절대 픽셀 xyxy**로 되돌린다. `(scale, x0, y0)` 계산은
+    `_letterbox`(비율 유지 리사이즈 + 중앙 패딩)와 정확히 반대 연산이다.
+
+    2026-09-06 — observe_target()을 Hailo로 옮기면서 새로 필요해진
+    변환이다. `OBSERVE_MIN_BOTTOM_Y_PX`나 거리 보정 상수
+    (`CLASS_DISTANCE_CALIBRATION_SQRT_PX_M`)는 전부 원본 프레임의 절대
+    픽셀 좌표를 전제로 튜닝됐다 — 레터박스 캔버스 좌표를 그대로 넘기면
+    (a) 패딩 오프셋만큼 어긋나고 (b) 정규화(0~1) 스케일이라 전혀 다른
+    값이 되어 두 게이트 모두 조용히 오작동한다. `perception_node.py`가
+    아니라 여기 있는 이유는 `object_class_for_hailo_id`와 같다 — rclpy
+    없이 순수 pytest로 좌표 왕복(letterbox → 이 함수)이 원래 좌표로
+    돌아오는지 검증하기 위함이다(test_hailo_scan_mapping.py 참고)."""
+    y_min, x_min, y_max, x_max, score = det
+    scale = min(canvas_size / orig_h, canvas_size / orig_w)
+    resized_w = round(orig_w * scale)
+    resized_h = round(orig_h * scale)
+    x0 = (canvas_size - resized_w) // 2
+    y0 = (canvas_size - resized_h) // 2
+    x1 = (x_min * canvas_size - x0) / scale
+    y1 = (y_min * canvas_size - y0) / scale
+    x2 = (x_max * canvas_size - x0) / scale
+    y2 = (y_max * canvas_size - y0) / scale
+    return (x1, y1, x2, y2), float(score)

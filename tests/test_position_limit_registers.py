@@ -189,4 +189,13 @@ def test_교시_각도제한이_백업_파일과_같다():
     expected = {ids[n]: (r["Min_Position_Limit"], r["Max_Position_Limit"])
                 for n, r in data["motors"].items()}
 
+    # 2026-09-07 — 서보6(gripper)만 예외. 팀원(sysy009)이 vla-into-baseline
+    # 브랜치에서 이 백업(2026-08-29 스냅샷) 이후 Min_Angle_Limit을
+    # 1140->1090으로 실측 변경했고(floor_grasp_profiles.TAUGHT_POSITION_
+    # LIMITS 정의부 주석 참고), restore_taught_offsets.py로 물리 EEPROM이
+    # 실제로 1090임을 재확인해서 baseline에도 그대로 반영했다. 이 백업
+    # 파일 자체는 그 시점의 기록이라 고치지 않고, 여기서만 알려진 차이로
+    # 보정해서 비교한다.
+    expected[6] = (1090, expected[6][1])
+
     assert profiles.TAUGHT_POSITION_LIMITS == expected

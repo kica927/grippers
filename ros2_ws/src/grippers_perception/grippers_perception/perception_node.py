@@ -43,7 +43,11 @@ from grippers_perception.cpu_yolo_scan_mapping import (
     object_class_for_cpu_yolo_class_name,
 )
 from grippers_perception.floor_consensus import CONF_THRESHOLD, confirmed_tracks, track_bbox_xyxy
-from grippers_perception.hailo_scan_mapping import HAILO_CLASS_NAMES, object_class_for_hailo_id
+from grippers_perception.hailo_scan_mapping import (
+    HAILO_CLASS_NAMES,
+    hailo_bbox_to_frame_xyxy,
+    object_class_for_hailo_id,
+)
 
 try:
     from sensor_msgs.msg import CameraInfo, Image
@@ -481,10 +485,22 @@ class PerceptionNode(Node):
             # 2026-09-06: Hailo가 import는 되는데 실제 로드(_load_hailo_model)가
             # 실패하면(예: 다시 DDR 손상 재발) 예전엔 아무 백엔드도 안 남고
             # scan_floor가 통째로 죽었다 — CPU YOLO로 넘어가게 폴백을 둔다.
-            if self._hailo_model is None and _CPU_YOLO_AVAILABLE:
+            if self._hailo_model is None:
                 self.get_logger().warn(
                     "scan_floor: Hailo 로드 실패 — CPU YOLO로 폴백"
                 )
+            # 2026-09-06 (같은 날 후속) — 위 폴백만으로는 부족했다: Hailo가
+            # 정상 로드되면(DDR 손상이 복구된 경우) 이 분기를 안 타서
+            # _cpu_yolo_model이 계속 None으로 남았는데, observe_target()
+            # (GRASP 진입 판정·파지 확인이 쓰는 서비스, 823행 참고)은
+            # **CPU YOLO 전용**이라 Hailo 결과를 아예 안 본다. 그 결과
+            # Hailo가 하드웨어적으로 되살아난 순간 GRASP 판정 자체가
+            # "YOLO 모델 미로드"로 항상 실패하는 회귀가 실기에서 났다
+            # (rook을 앞에 두고도 계속 GRASP_BLOCKED). scan_floor 백엔드
+            # 선택과 무관하게 CPU YOLO는 항상 따로 로드해 둔다 — 이 둘은
+            # 서로 다른 용도(scan_floor는 바닥 스캔, observe_target은
+            # 정면 관측)라 동시에 있어도 된다.
+            if _CPU_YOLO_AVAILABLE:
                 self._load_cpu_yolo_model()
         elif _CPU_YOLO_AVAILABLE:
             self._load_cpu_yolo_model()
@@ -509,6 +525,64 @@ class PerceptionNode(Node):
             f"(scan_floor: {scan_floor_state}, "
             "find_box/measure_opening/monitor_clearance: NOT IMPLEMENTED)"
         )
+
+        # 2026-09-06 — 사용자 요청: Hailo/CPU YOLO 둘 다 로드되는 지금이
+        # 순추론 속도(모델·게이트 로직 전, 텐서 연산 자체)를 같은 조건에서
+        # 비교할 좋은 기회라 부팅 때 한 번 재서 로그로 남긴다. 아직 실제
+        # 카메라 프레임이 안 왔을 시점이라 더미(랜덤 노이즈) 프레임을
+        # 쓴다 — 두 백엔드 모두 letterbox/리사이즈를 거치므로 내용보다
+        # 텐서 크기가 속도를 지배해 더미로도 비교엔 충분하다. 정확도(검출
+        # 여부) 비교가 아니라 **속도**만 잰다.
+        self._benchmark_backends()
+
+    def _benchmark_backends(self):
+        """Hailo와 CPU YOLO의 순추론 지연시간을 같은 더미 프레임으로 재서
+        비교 로그를 남긴다. 실제 검출 로직(레터박스 이후 파싱, 클래스
+        매핑, 게이트)은 배제하고 `_hailo_raw_infer`/`_yolo_raw_frame_detections`
+        (predict 자체)만 반복 호출한다 — 진단 목적이라 여기서 예외가 나도
+        노드 초기화를 막지 않는다."""
+        n_warmup, n_runs = 3, 20
+        dummy = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+
+        def _time_calls(fn, label):
+            try:
+                for _ in range(n_warmup):
+                    fn()
+                samples_ms = []
+                for _ in range(n_runs):
+                    t0 = time.perf_counter()
+                    fn()
+                    samples_ms.append((time.perf_counter() - t0) * 1000.0)
+            except Exception as exc:  # noqa: BLE001 -- 진단용, 실패해도 노드는 살아야 한다
+                self.get_logger().warn(f"[benchmark] {label} 추론 실패 — 비교에서 제외 ({exc})")
+                return None
+            mean_ms = statistics.mean(samples_ms)
+            self.get_logger().info(
+                f"[benchmark] {label}: 평균 {mean_ms:.1f}ms "
+                f"(min {min(samples_ms):.1f} / max {max(samples_ms):.1f}, "
+                f"표준편차 {statistics.pstdev(samples_ms):.1f}) "
+                f"≈ {1000.0 / mean_ms:.1f} FPS  (n={n_runs}, 더미 프레임)"
+            )
+            return mean_ms
+
+        hailo_ms = cpu_ms = None
+        if self._hailo_model is not None:
+            canvas = self._letterbox(dummy, self._hailo_input_size)
+            hailo_ms = _time_calls(lambda: self._hailo_raw_infer(canvas), "Hailo-10H")
+        if self._cpu_yolo_model is not None:
+            cpu_ms = _time_calls(lambda: self._yolo_raw_frame_detections(dummy), "CPU YOLO")
+
+        if hailo_ms is not None and cpu_ms is not None:
+            faster = "Hailo" if hailo_ms < cpu_ms else "CPU YOLO"
+            ratio = max(hailo_ms, cpu_ms) / min(hailo_ms, cpu_ms)
+            self.get_logger().info(
+                f"[benchmark] 결론: {faster}가 {ratio:.1f}배 빠름 "
+                f"(Hailo {hailo_ms:.1f}ms vs CPU YOLO {cpu_ms:.1f}ms, 더미 프레임 기준)"
+            )
+        elif hailo_ms is None and cpu_ms is None:
+            self.get_logger().warn("[benchmark] 두 백엔드 모두 없음 — 비교 불가")
+        else:
+            self.get_logger().warn("[benchmark] 한쪽 백엔드만 로드됨 — 비교 불가")
 
     def _load_hailo_model(self):
         """VDevice/ConfiguredInferModel을 한 번만 만든다. 물리 Hailo-10H가
@@ -613,14 +687,23 @@ class PerceptionNode(Node):
         y_obj = -(u - self._rgb_cx) * z_m / self._rgb_fx
         return _standoff_arrival_pose(z_m, y_obj)
 
-    def _scan_floor_detections_hailo(self, frame):
-        canvas = self._letterbox(frame, self._hailo_input_size)
-
+    def _hailo_raw_infer(self, canvas):
+        """Hailo 순추론만 한다(레터박스 이후, 클래스 매핑/게이트/로그 전).
+        2026-09-06 — scan_floor 실경로(원래 이 몸통이 있던 자리)와 벤치마크
+        (_benchmark_backends)가 같은 호출을 공유하게 뽑아냈다. 실경로에
+        박혀 있던 검출 로그(`get_logger().info`)는 여기 없다 — 벤치마크가
+        N번 반복 호출할 때 로그가 홍수처럼 쏟아지는 걸 막기 위함이고,
+        실경로 쪽 로그는 호출자(_scan_floor_detections_hailo)에 그대로
+        남아 있다."""
         bindings = self._hailo_model.create_bindings()
         bindings.input().set_buffer(np.ascontiguousarray(canvas))
         bindings.output().set_buffer(np.empty(self._hailo_output_shape, dtype=np.float32))
         self._hailo_model.run([bindings], timeout=1000)
-        detections_by_class = bindings.output().get_buffer()
+        return bindings.output().get_buffer()
+
+    def _scan_floor_detections_hailo(self, frame):
+        canvas = self._letterbox(frame, self._hailo_input_size)
+        detections_by_class = self._hailo_raw_infer(canvas)
 
         detections = []
         track_id = 0
@@ -659,6 +742,49 @@ class PerceptionNode(Node):
             bbox_xyxy = tuple(float(v) for v in box.xyxy[0])
             raw_detections.append((class_name, score, bbox_xyxy))
         return raw_detections
+
+    def _hailo_raw_frame_detections(self, frame):
+        """`_yolo_raw_frame_detections`의 Hailo판 — 반환 형식
+        `[(raw_cls, conf, bbox_xyxy), ...]`을 그대로 맞춘다(원본 프레임의
+        절대 픽셀 xyxy, `_hailo_bbox_to_frame_xyxy` 참고). observe_target
+        쪽 게이트/합의/거리보정 코드가 백엔드를 몰라도 되게 하기 위함이다.
+
+        2026-09-06 — Hailo가 CPU YOLO보다 25배 빠르다는 실측(부팅 시
+        벤치마크 로그 참고) 이후, GRASP 판정(observe_target)도 Hailo로
+        옮기는 작업의 일부로 추가했다. CONF_THRESHOLD(0.45, scan_floor와
+        공유)로 넉넉하게 열어 두고 최종 판단은 `_gate_observe_detections`
+        (0.70)에 맡긴다 — `_yolo_raw_frame_detections`와 같은 관례."""
+        h, w = frame.shape[:2]
+        canvas = self._letterbox(frame, self._hailo_input_size)
+        detections_by_class = self._hailo_raw_infer(canvas)
+        raw_detections = []
+        for class_id, dets in enumerate(detections_by_class):
+            if class_id >= len(HAILO_CLASS_NAMES):
+                continue
+            class_name = HAILO_CLASS_NAMES[class_id]
+            for det in dets:
+                bbox_xyxy, score = hailo_bbox_to_frame_xyxy(
+                    det, self._hailo_input_size, h, w)
+                if score < CONF_THRESHOLD:
+                    continue
+                raw_detections.append((class_name, score, bbox_xyxy))
+        return raw_detections
+
+    def _collect_hailo_frames(self, n_frames, timeout_sec):
+        """`_collect_cpu_yolo_frames`의 Hailo판 — 로직은 동일하고 프레임당
+        추론만 `_hailo_raw_frame_detections`로 바꿨다."""
+        frames = []
+        last_msg = None
+        deadline = time.monotonic() + timeout_sec
+        while len(frames) < n_frames and time.monotonic() < deadline:
+            current = self._latest_frame
+            if current is None or current is last_msg:
+                time.sleep(0.01)
+                continue
+            last_msg = current
+            frame = _bgr_from_image_msg(current)
+            frames.append(self._hailo_raw_frame_detections(frame))
+        return frames
 
     def _collect_cpu_yolo_frames(self, n_frames, timeout_sec):
         """정지 상태를 전제로 서로 다른 n_frames개 프레임에 대해 YOLO 추론을
@@ -793,14 +919,24 @@ class PerceptionNode(Node):
         3초 안에 들어오면 그 움직임 **이전**에 찍은 낡은 프레임을 그대로
         돌려줘 "지금은 잘 보이는데 못 찾음"으로 오답했다. `force_fresh=True`
         면 캐시 나이와 무관하게 무조건 새로 모은다 — 호출자(Ros2Perception)가
-        매 판정 라운드의 첫 질문에서만 세운다."""
+        매 판정 라운드의 첫 질문에서만 세운다.
+
+        ⚠️ 2026-09-06: Hailo가 25배 빠르다는 실측(부팅 벤치마크) 이후 여기도
+        Hailo를 우선 쓰도록 바꿨다 — 있으면 Hailo, 없으면(하드웨어 재고장 등)
+        기존 CPU YOLO로 폴백한다. 두 경로 다 `_yolo_raw_frame_detections`와
+        같은 반환 형식이라 호출자(`_on_observe_target`)는 어느 쪽이
+        쓰였는지 몰라도 된다."""
         now = time.monotonic()
         if (not force_fresh and self._observe_samples_cache is not None
                 and now - self._observe_samples_at < OBSERVE_CACHE_SEC):
             return self._observe_samples_cache
 
-        frames = self._collect_cpu_yolo_frames(
-            OBSERVE_CONSENSUS_FRAMES, OBSERVE_COLLECT_TIMEOUT_SEC)
+        if self._hailo_model is not None:
+            frames = self._collect_hailo_frames(
+                OBSERVE_CONSENSUS_FRAMES, OBSERVE_COLLECT_TIMEOUT_SEC)
+        else:
+            frames = self._collect_cpu_yolo_frames(
+                OBSERVE_CONSENSUS_FRAMES, OBSERVE_COLLECT_TIMEOUT_SEC)
         self._observe_samples_cache = frames
         # 수집을 **마친** 시각을 쓴다. 시작 시각을 쓰면 수집에 걸린 시간이
         # 창에서 먼저 깎여 나가 캐시가 거의 즉시 만료된다.
@@ -820,9 +956,19 @@ class PerceptionNode(Node):
         노트북을 rook 0.60으로 잡았다. 7프레임 중 2번만 나왔으므로 합의가
         걸러 낸다.
 
-        CPU YOLO 백엔드 전용. 모델 미로드·프레임 없음·합의 미달은 전부
-        found=False — "모르면 실패" 관례. 여러 후보가 있으면 가장 큰(=가까운)
-        것을 고른다.
+        2026-09-06까지는 CPU YOLO 전용이었다 — 이제 Hailo가 있으면 Hailo를
+        쓰고(`_observe_samples` 참고), 없을 때만 CPU YOLO로 폴백한다.
+        `identify_target`의 KNOWN_LABELS에 없는 "container"(Hailo 전용
+        클래스)는 요청 클래스로 걸러내는 시점에 자연히 빠진다 — 애초에
+        아무도 그 이름으로 묻지 않는다. 모델 미로드(Hailo·CPU YOLO 둘 다
+        없음)·프레임 없음·합의 미달은 전부 found=False — "모르면 실패"
+        관례. 여러 후보가 있으면 가장 큰(=가까운) 것을 고른다.
+
+        ⚠️ 거리 보정 상수(`CLASS_DISTANCE_CALIBRATION_SQRT_PX_M`)는 CPU
+        YOLO 시절 bbox로 실측된 값이다. Hailo가 letterbox 역변환을 거쳐
+        같은 원본 프레임 좌표계로 돌아오긴 하지만, 두 모델의 바운딩박스
+        여백 특성까지 같다는 보장은 없다 — **실기 재검증 전까지는
+        거리·좌우 오프셋값을 의심할 것.**
 
         response.reason: found=False일 때 왜인지(2026-09-01 추가, 사용자
         지시). 2026-09-01 실기: YOLO는 conf 0.97로 정확히 잡았는데
@@ -840,8 +986,10 @@ class PerceptionNode(Node):
         response.forward_m = 0.0
         response.lateral_m = 0.0
         response.reason = ""
-        if self._cpu_yolo_model is None or self._latest_frame is None:
-            response.reason = ("YOLO 모델 미로드" if self._cpu_yolo_model is None
+        if (self._hailo_model is None and self._cpu_yolo_model is None) \
+                or self._latest_frame is None:
+            response.reason = ("YOLO 모델 미로드"
+                                if self._hailo_model is None and self._cpu_yolo_model is None
                                 else "RGB 프레임을 아직 못 받음")
             return response
 
@@ -963,6 +1111,7 @@ class PerceptionNode(Node):
         x0 = (size - resized.shape[1]) // 2
         canvas[y0 : y0 + resized.shape[0], x0 : x0 + resized.shape[1]] = resized
         return canvas
+
 
 
 def main(args=None):
